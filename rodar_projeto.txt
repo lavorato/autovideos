@@ -1,0 +1,3 @@
+python execution/run_pipeline.py --dry-run
+python execution/run_pipeline.py --dry-run --step 08b
+python execution/run_pipeline.py --dry-run --only 01,09

@@ -1,0 +1,138 @@
+"""
+Step 10: Add background music from a random track in music/ folder.
+Loops the track if shorter than the video, fades out at the end.
+Volume is configurable below.
+"""
+import sys
+import os
+import random
+import subprocess
+
+from video_encoding import first_existing_nonempty_video
+
+# --- Config ---
+MUSIC_VOLUME = 0.10        # 0.0 to 1.0 — how loud the music is relative to original audio
+FADE_OUT_DURATION = 3.0    # seconds of fade out at the end
+MUSIC_DIR = "music"
+
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac", ".opus"}
+
+
+def pick_random_track(music_dir: str = MUSIC_DIR) -> str | None:
+    """Pick a random audio file from the music directory."""
+    if not os.path.isdir(music_dir):
+        return None
+    tracks = [
+        os.path.join(music_dir, f)
+        for f in os.listdir(music_dir)
+        if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS
+    ]
+    if not tracks:
+        return None
+    chosen = random.choice(tracks)
+    return chosen
+
+
+def get_duration(path: str) -> float:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(probe.stdout.strip())
+
+
+def add_background_music(video_path: str, tmp_dir: str = ".tmp",
+                          output_dir: str = "output") -> str:
+    base = os.path.splitext(os.path.basename(video_path))[0]
+
+    # Resolve input: prefer final, then intermediates (skip empty files)
+    candidates = [
+        os.path.join(output_dir, f"{base}_final.mp4"),
+        os.path.join(tmp_dir, f"{base}_broll.mp4"),
+        os.path.join(tmp_dir, f"{base}_hardcut.mp4"),
+        os.path.join(tmp_dir, f"{base}_effects.mp4"),
+        os.path.join(tmp_dir, f"{base}_color.mp4"),
+        os.path.join(tmp_dir, f"{base}_fixed_audio.mp4"),
+        os.path.join(tmp_dir, f"{base}_studio.mp4"),
+        video_path,
+    ]
+    input_video = first_existing_nonempty_video(candidates)
+    if not input_video:
+        print("[10] No readable input video, skipping.")
+        return ""
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{base}_final.mp4")
+
+    # Pick a track
+    track = pick_random_track()
+    if not track:
+        print(f"[10] No music files found in {MUSIC_DIR}/, skipping.")
+        return ""
+
+    print(f"[10] Selected track: {os.path.basename(track)}")
+    print(f"[10] Music volume: {MUSIC_VOLUME} ({int(MUSIC_VOLUME * 100)}%)")
+
+    video_duration = get_duration(input_video)
+    track_duration = get_duration(track)
+    print(f"[10] Video: {video_duration:.1f}s, Track: {track_duration:.1f}s")
+
+    # Build audio filter:
+    # 1. Loop music if needed to cover full video
+    # 2. Trim to video length
+    # 3. Apply volume
+    # 4. Fade out at the end
+    # 5. Mix with original audio
+    fade_start = max(0, video_duration - FADE_OUT_DURATION)
+
+    # Use aloop if track is shorter, otherwise just trim
+    if track_duration < video_duration:
+        loops_needed = int(video_duration / track_duration) + 1
+        music_input = f"[1:a]aloop=loop={loops_needed}:size={int(track_duration * 48000)},"
+    else:
+        music_input = "[1:a]"
+
+    audio_filter = (
+        f"{music_input}"
+        f"atrim=0:{video_duration},"
+        f"asetpts=PTS-STARTPTS,"
+        f"volume={MUSIC_VOLUME},"
+        f"afade=t=out:st={fade_start}:d={FADE_OUT_DURATION}"
+        f"[music];"
+        f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[outa]"
+    )
+
+    # If input and output are the same file, use a temp path
+    use_temp = os.path.abspath(input_video) == os.path.abspath(output_path)
+    actual_output = output_path + ".tmp.mp4" if use_temp else output_path
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_video,
+        "-i", track,
+        "-filter_complex", audio_filter,
+        "-map", "0:v", "-map", "[outa]",
+        "-c:v", "copy",
+        "-c:a", "alac",
+        actual_output,
+    ]
+
+    print("[10] Mixing background music...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[10] FFmpeg error: {result.stderr[-600:]}")
+        raise RuntimeError(f"Background music mixing failed (exit {result.returncode})")
+
+    if use_temp:
+        os.replace(actual_output, output_path)
+
+    print(f"[10] Output: {output_path}")
+    return output_path
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python 10_background_music.py <video_path>")
+        sys.exit(1)
+    add_background_music(sys.argv[1])

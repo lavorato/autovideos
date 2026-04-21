@@ -1,0 +1,644 @@
+"""
+Step 8c: B-Roll Overlay — scans input/{base}/ for asset files (videos, images),
+analyzes transcript to find the best placement for each asset, then renders
+animated split-view overlays using Remotion and composites onto the main video.
+
+Assets folder: input/{video_base_name}/
+  - Supports: .mp4, .mov, .webm, .jpg, .jpeg, .png, .webp, .gif
+  - Filenames can hint at content (e.g. "product.jpg", "store_front.mp4")
+
+If no assets folder exists, this step is skipped.
+
+Optional semantic matching via OpenRouter:
+  - OPENROUTER_API_KEY=<key>
+  - OPENROUTER_MODEL=<provider/model> or OPENROUTER_MODELS=<m1,m2,m3>
+When configured, the script tries the provided model(s) in order and falls
+back to local keyword matching if the API call fails.
+"""
+import sys
+import os
+import json
+import subprocess
+import re
+import random
+from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
+from video_encoding import build_lossless_x264_args, first_existing_nonempty_video
+
+# --- Config ---
+MIN_BROLL_DURATION = 3.0  # seconds minimum per b-roll
+MAX_BROLL_DURATION = 6.0  # seconds max per b-roll
+SPLIT_RATIO = 0.45        # how much of the frame the b-roll takes
+# FFmpeg scale/crop require strictly positive width/height; margins shrink on small frames.
+MIN_BROLL_PANEL = 2  # minimum split panel size (px) along the short axis
+BROLL_MARGIN_CAP = 16
+REMOTION_DIR = os.path.join(os.path.dirname(__file__), "broll-renderer")
+USE_REMOTION_BY_DEFAULT = False  # Remotion can render black clips with local assets.
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+
+ANIMATIONS = ["slide-left", "slide-right", "slide-up", "scale-in"]
+POSITIONS = ["top", "bottom"]
+MAX_LLM_SEGMENTS = 80
+MAX_LLM_SEGMENT_TEXT = 220
+
+
+def find_assets(video_path: str) -> list:
+    """Find assets in input/{base}/ folder."""
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    assets_dir = os.path.join("input", base)
+
+    if not os.path.isdir(assets_dir):
+        return []
+
+    assets = []
+    for f in sorted(os.listdir(assets_dir)):
+        ext = os.path.splitext(f)[1].lower()
+        full_path = os.path.abspath(os.path.join(assets_dir, f))
+        if ext in IMAGE_EXTENSIONS:
+            assets.append({"path": full_path, "name": f, "type": "image"})
+        elif ext in VIDEO_EXTENSIONS:
+            # Get video duration
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", full_path],
+                    capture_output=True, text=True, check=True,
+                )
+                dur = float(probe.stdout.strip())
+                assets.append({"path": full_path, "name": f, "type": "video", "duration": dur})
+            except Exception:
+                assets.append({"path": full_path, "name": f, "type": "video", "duration": 5.0})
+
+    return assets
+
+
+def extract_keywords_from_filename(filename: str) -> list:
+    """Extract keywords from asset filename for matching."""
+    name = os.path.splitext(filename)[0]
+    # Split by common separators
+    words = re.split(r"[-_ .]+", name.lower())
+    # Filter out generic words and numbers
+    stopwords = {"img", "image", "photo", "video", "clip", "broll",
+                 "asset", "media", "content", "dsc", "mov", "screenshot"}
+    return [w for w in words if len(w) > 2 and w not in stopwords and not w.isdigit()]
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract and parse the first JSON object found in text."""
+    if not text:
+        return None
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def suggest_segments_with_openrouter(assets: list, segments: list, models: list[str]) -> tuple[dict, str | None]:
+    """
+    Use OpenRouter LLM to map asset filenames to transcript segment indices.
+    Returns (asset_name -> segment_index, model_used). Empty map on failure.
+    """
+    if not assets or not segments or not models:
+        return {}, None
+
+    # Limit transcript payload to keep token usage predictable.
+    payload_segments = []
+    for idx, seg in enumerate(segments[:MAX_LLM_SEGMENTS]):
+        text = seg.get("text", "").strip()
+        if len(text) > MAX_LLM_SEGMENT_TEXT:
+            text = text[:MAX_LLM_SEGMENT_TEXT] + "..."
+        payload_segments.append({
+            "index": idx,
+            "start": round(float(seg.get("start", 0.0)), 3),
+            "text": text,
+        })
+
+    asset_names = [a["name"] for a in assets]
+
+    system_prompt = (
+        "You place B-roll assets onto transcript segments. "
+        "Return strict JSON only."
+    )
+    user_prompt = (
+        "Choose the best transcript segment for each asset.\n"
+        "Use semantic meaning from filenames and transcript text.\n"
+        "If no good segment exists, use null.\n\n"
+        "Return exactly this JSON schema:\n"
+        '{ "matches": [ { "asset": "filename.ext", "segment_index": 0, "confidence": 0.0 } ] }\n'
+        "- segment_index must be null or an integer from the provided segment list.\n"
+        "- confidence must be between 0 and 1.\n\n"
+        f"Assets:\n{json.dumps(asset_names, ensure_ascii=False)}\n\n"
+        f"Segments:\n{json.dumps(payload_segments, ensure_ascii=False)}"
+    )
+
+    for model in models:
+        print(f"[08c] OpenRouter: trying model '{model}' for asset matching...")
+        try:
+            response_text = chat_completion(
+                model=model,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.1,
+                max_tokens=900,
+            )
+            parsed = _extract_json_object(response_text)
+            if not parsed:
+                print(f"[08c] OpenRouter '{model}' returned non-JSON output.")
+                continue
+
+            raw_matches = parsed.get("matches", [])
+            if not isinstance(raw_matches, list):
+                print(f"[08c] OpenRouter '{model}' missing matches array.")
+                continue
+
+            mapping = {}
+            for item in raw_matches:
+                if not isinstance(item, dict):
+                    continue
+                asset_name = str(item.get("asset", "")).strip()
+                if asset_name not in asset_names:
+                    continue
+                seg_idx = item.get("segment_index")
+                if isinstance(seg_idx, int) and 0 <= seg_idx < len(payload_segments):
+                    mapping[asset_name] = seg_idx
+
+            if mapping:
+                print(f"[08c] OpenRouter selected {len(mapping)} matches with model '{model}'.")
+                return mapping, model
+
+            print(f"[08c] OpenRouter '{model}' returned no valid matches.")
+        except Exception as exc:
+            print(f"[08c] OpenRouter '{model}' failed: {exc}")
+
+    return {}, None
+
+
+def match_assets_to_segments(assets: list, segments: list, video_duration: float) -> list:
+    """Match each asset to the best transcript segment based on content.
+    Falls back to even distribution if no keyword matches found."""
+
+    if not segments or not assets:
+        return []
+
+    placements = []
+    used_time_ranges = []
+
+    def overlaps(start, end):
+        for us, ue in used_time_ranges:
+            if start < ue and end > us:
+                return True
+        return False
+
+    def find_best_segment(asset, available_segments):
+        """Try keyword match first, then fall back to spacing."""
+        keywords = extract_keywords_from_filename(asset["name"])
+        best_score = 0
+        best_seg = None
+
+        if keywords:
+            for seg in available_segments:
+                text = seg.get("text", "").lower()
+                score = sum(1 for kw in keywords if kw in text)
+                if score > best_score:
+                    best_score = score
+                    best_seg = seg
+        return best_seg
+
+    # Sort segments by start time
+    sorted_segments = sorted(segments, key=lambda s: s.get("start", 0))
+    available = list(sorted_segments)
+
+    llm_mapping = {}
+    llm_model = None
+    if has_openrouter_api_key():
+        candidate_models = parse_models_from_env()
+        if candidate_models:
+            llm_mapping, llm_model = suggest_segments_with_openrouter(
+                assets=assets,
+                segments=sorted_segments,
+                models=candidate_models,
+            )
+        else:
+            print("[08c] OPENROUTER_API_KEY found, but no OPENROUTER_MODEL(S) configured.")
+    if llm_model:
+        print(f"[08c] Using OpenRouter model '{llm_model}' for semantic placement hints.")
+
+    for idx, asset in enumerate(assets):
+        matched_seg = None
+
+        # Prefer semantic mapping from OpenRouter when available.
+        llm_seg_idx = llm_mapping.get(asset["name"])
+        if isinstance(llm_seg_idx, int) and 0 <= llm_seg_idx < len(sorted_segments):
+            matched_seg = sorted_segments[llm_seg_idx]
+
+        # Fallback: local keyword matching.
+        if matched_seg is None:
+            matched_seg = find_best_segment(asset, available)
+
+        if matched_seg:
+            start_time = matched_seg["start"]
+        else:
+            # Evenly distribute across video duration
+            spacing = video_duration / (len(assets) + 1)
+            start_time = spacing * (idx + 1)
+            # Snap to nearest segment start for natural placement
+            closest = min(sorted_segments, key=lambda s: abs(s["start"] - start_time))
+            start_time = closest["start"]
+
+        # Determine duration
+        if asset["type"] == "video" and "duration" in asset:
+            broll_dur = min(max(asset["duration"], MIN_BROLL_DURATION), MAX_BROLL_DURATION)
+        else:
+            broll_dur = random.uniform(MIN_BROLL_DURATION, MAX_BROLL_DURATION)
+
+        end_time = min(start_time + broll_dur, video_duration - 0.5)
+
+        # Avoid overlap with existing placements
+        if overlaps(start_time, end_time):
+            # Shift forward
+            for seg in sorted_segments:
+                test_start = seg["start"]
+                test_end = min(test_start + broll_dur, video_duration - 0.5)
+                if not overlaps(test_start, test_end) and test_start > 2.0:
+                    start_time = test_start
+                    end_time = test_end
+                    break
+
+        if overlaps(start_time, end_time):
+            continue  # skip if still overlapping
+
+        used_time_ranges.append((start_time, end_time))
+
+        # Cycle through animation/position styles
+        anim = ANIMATIONS[idx % len(ANIMATIONS)]
+        pos = POSITIONS[idx % len(POSITIONS)]
+
+        placements.append({
+            "asset": asset,
+            "start_time": round(start_time, 3),
+            "end_time": round(end_time, 3),
+            "duration": round(end_time - start_time, 3),
+            "animation": anim,
+            "position": pos,
+        })
+
+    placements.sort(key=lambda p: p["start_time"])
+    return placements
+
+
+def calc_broll_dimensions(pos: str, vid_w: int, vid_h: int) -> tuple:
+    """Calculate B-roll inner dimensions and overlay position."""
+    vid_w = max(1, int(vid_w))
+    vid_h = max(1, int(vid_h))
+    if pos in ("left", "right"):
+        bw = min(vid_w, max(MIN_BROLL_PANEL, int(vid_w * SPLIT_RATIO)))
+        bh = vid_h
+    else:
+        bw = vid_w
+        bh = min(vid_h, max(MIN_BROLL_PANEL, int(vid_h * SPLIT_RATIO)))
+
+    # Keep inner_w / inner_h >= 1 for FFmpeg scale=crop=
+    margin = min(
+        BROLL_MARGIN_CAP,
+        max(0, (bw - 1) // 2),
+        max(0, (bh - 1) // 2),
+    )
+    inner_w = bw - margin * 2
+    inner_h = bh - margin * 2
+
+    if pos == "left":
+        x, y = margin, margin
+    elif pos == "right":
+        x, y = vid_w - bw + margin, margin
+    elif pos == "top":
+        x, y = margin, margin
+    else:  # bottom
+        x, y = margin, vid_h - bh + margin
+
+    return inner_w, inner_h, x, y
+
+
+def render_broll_clip(placement: dict, idx: int, vid_w: int, vid_h: int,
+                      fps: float, tmp_dir: str) -> str | None:
+    """Render a single B-roll clip with Remotion at the B-roll's own dimensions."""
+    inner_w, inner_h, _, _ = calc_broll_dimensions(
+        placement["position"], vid_w, vid_h
+    )
+
+    config = {
+        "fps": int(fps),
+        "width": inner_w,
+        "height": inner_h,
+        "durationInFrames": int(placement["duration"] * fps),
+        "mainVideoSrc": "",
+        "segments": [{
+            "assetPath": placement["asset"]["path"],
+            "assetType": placement["asset"]["type"],
+            "startFrame": 0,
+            "durationFrames": int(placement["duration"] * fps),
+            "animation": placement["animation"],
+            "splitRatio": SPLIT_RATIO,
+            "position": placement["position"],
+        }],
+    }
+
+    config_path = os.path.abspath(os.path.join(tmp_dir, f"broll_clip_{idx}.json"))
+    output_path = os.path.abspath(os.path.join(tmp_dir, f"broll_clip_{idx}.mp4"))
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    env = os.environ.copy()
+    env["BROLL_CONFIG"] = config_path
+
+    cmd = [
+        "npx", "remotion", "render",
+        "src/index.tsx", "BrollComposition",
+        output_path,
+        "--codec", "h264",
+        "--crf", "0",
+        "--x264-preset", "veryslow",
+        "--log", "error",
+    ]
+    result = subprocess.run(
+        cmd, cwd=REMOTION_DIR, env=env,
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0:
+        print(f"  Remotion clip {idx} failed: {result.stderr[-300:]}")
+        return None
+
+    # Clean up config
+    os.remove(config_path)
+    return output_path
+
+
+def composite_broll_clips(placements: list, clip_paths: list,
+                           main_video: str, output_path: str,
+                           main_w: int, main_h: int, fps: float) -> str:
+    """Overlay rendered B-roll clips onto the main video using FFmpeg.
+    Each clip is already rendered at the correct B-roll dimensions by Remotion."""
+    inputs = ["-i", main_video]
+    filter_parts = []
+    current_label = "[0:v]"
+
+    clip_idx = 0
+    for idx, p in enumerate(placements):
+        clip = clip_paths[idx]
+        if clip is None:
+            continue
+        inputs.extend(["-i", clip])
+        clip_idx += 1
+        inp = clip_idx
+
+        _, _, x, y = calc_broll_dimensions(p["position"], main_w, main_h)
+        start_t = p["start_time"]
+        end_t = p["end_time"]
+
+        scale_label = f"s{idx}"
+        overlay_label = f"[ov{idx}]"
+
+        # Shift the clip to its timeline slot so it is still alive at start_t.
+        filter_parts.append(
+            f"[{inp}:v]setpts=PTS-STARTPTS+{start_t}/TB[{scale_label}]"
+        )
+        filter_parts.append(
+            f"{current_label}[{scale_label}]overlay={x}:{y}:"
+            f"enable='between(t,{start_t},{end_t})':eof_action=pass"
+            f"{overlay_label}"
+        )
+        current_label = overlay_label
+
+    if not filter_parts:
+        subprocess.run(["cp", main_video, output_path], check=True)
+        return output_path
+
+    filter_complex = ";".join(filter_parts)
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filter_complex,
+        "-map", current_label, "-map", "0:a",
+        *build_lossless_x264_args(main_video),
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[08c] FFmpeg composite error: {result.stderr[-800:]}")
+        raise RuntimeError(f"FFmpeg compositing failed (exit {result.returncode})")
+
+    return output_path
+
+
+def apply_broll_ffmpeg(placements: list, main_video: str,
+                        output_path: str, main_w: int, main_h: int) -> str:
+    """Direct FFmpeg compositing without Remotion (simpler animations)."""
+    if not placements:
+        subprocess.run(["cp", main_video, output_path], check=True)
+        return output_path
+
+    inputs = ["-i", main_video]
+    for p in placements:
+        inputs.extend(["-i", p["asset"]["path"]])
+
+    filter_parts = []
+    current_label = "[0:v]"
+
+    for idx, p in enumerate(placements):
+        inp_idx = idx + 1
+        start_t = p["start_time"]
+        end_t = p["end_time"]
+        pos = p["position"]
+
+        inner_w, inner_h, x, y = calc_broll_dimensions(pos, main_w, main_h)
+
+        scale_label = f"scaled{idx}"
+        # Shift the clip to its timeline slot so enable=between(t,...) can show it.
+        filter_parts.append(
+            f"[{inp_idx}:v]scale={inner_w}:{inner_h}:"
+            f"force_original_aspect_ratio=increase,"
+            f"crop={inner_w}:{inner_h},"
+            f"setpts=PTS-STARTPTS+{start_t}/TB"
+            f"[{scale_label}]"
+        )
+
+        overlay_label = f"[ov{idx}]"
+        filter_parts.append(
+            f"{current_label}[{scale_label}]overlay={x}:{y}:"
+            f"enable='between(t,{start_t},{end_t})':eof_action=pass"
+            f"{overlay_label}"
+        )
+        current_label = overlay_label
+
+    filter_complex = ";".join(filter_parts)
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filter_complex,
+        "-map", current_label, "-map", "0:a",
+        *build_lossless_x264_args(main_video),
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[08c] FFmpeg error: {result.stderr[-800:]}")
+        raise RuntimeError(f"FFmpeg compositing failed (exit {result.returncode})")
+
+    return output_path
+
+
+def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
+    base = os.path.splitext(os.path.basename(video_path))[0]
+
+    # Find assets
+    assets = find_assets(video_path)
+    if not assets:
+        print(f"[08c] No assets folder found at input/{base}/, skipping B-roll.")
+        return ""
+
+    print(f"[08c] Found {len(assets)} assets in input/{base}/:")
+    for a in assets:
+        print(f"  - {a['name']} ({a['type']})")
+
+    # Resolve input video (skip empty/corrupt intermediates, e.g. failed 08b)
+    candidates = [
+        os.path.join(tmp_dir, f"{base}_hardcut.mp4"),
+        os.path.join(tmp_dir, f"{base}_effects.mp4"),
+        os.path.join(tmp_dir, f"{base}_color.mp4"),
+        os.path.join(tmp_dir, f"{base}_fixed_audio.mp4"),
+        os.path.join(tmp_dir, f"{base}_studio.mp4"),
+        video_path,
+    ]
+    input_video = first_existing_nonempty_video(candidates)
+    if not input_video:
+        print("[08c] No readable input video found, skipping.")
+        return ""
+    if input_video != candidates[0]:
+        print(f"[08c] Using {input_video} (first choice missing or empty)")
+
+    output_path = os.path.join(tmp_dir, f"{base}_broll.mp4")
+
+    # Load transcript
+    transcript_path = os.path.join(tmp_dir, f"{base}_transcript.json")
+    segments = []
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        segments = data.get("segments", [])
+
+    # Get video info
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries",
+         "stream=width,height", "-show_entries", "format=duration",
+         "-select_streams", "v:0", "-of", "json", input_video],
+        capture_output=True, text=True, check=True,
+    )
+    info = json.loads(probe.stdout)
+    streams = info.get("streams") or []
+    if not streams:
+        print("[08c] ffprobe found no video stream, skipping.")
+        return ""
+    vid_w = max(1, int(streams[0].get("width") or 1))
+    vid_h = max(1, int(streams[0].get("height") or 1))
+    duration = float(info["format"]["duration"])
+    fps_probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "stream=r_frame_rate",
+         "-select_streams", "v:0", "-of", "default=noprint_wrappers=1:nokey=1",
+         input_video],
+        capture_output=True, text=True, check=True,
+    )
+    fps_str = fps_probe.stdout.strip()
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(fps_str)
+
+    print(f"[08c] Video: {vid_w}x{vid_h}, {duration:.1f}s, {fps:.2f}fps")
+
+    # Match assets to transcript
+    placements = match_assets_to_segments(assets, segments, duration)
+    if not placements:
+        print("[08c] Could not place any B-rolls, skipping.")
+        return ""
+
+    print("[08c] B-roll placements:")
+    for p in placements:
+        print(f"  {p['start_time']:.1f}s-{p['end_time']:.1f}s: "
+              f"{p['asset']['name']} ({p['animation']}, {p['position']})")
+
+    # Strategy: render each B-roll clip individually with Remotion (animated),
+    # then overlay all clips onto the main video with FFmpeg.
+    # Falls back to direct FFmpeg overlay (simpler, no spring animations) if Remotion fails.
+    remotion_enabled = (
+        os.environ.get("BROLL_USE_REMOTION", "").strip().lower() in {"1", "true", "yes"}
+    )
+    remotion_ok = (
+        remotion_enabled
+        and os.path.isdir(os.path.join(REMOTION_DIR, "node_modules"))
+    )
+
+    if not remotion_enabled and USE_REMOTION_BY_DEFAULT:
+        remotion_ok = os.path.isdir(os.path.join(REMOTION_DIR, "node_modules"))
+
+    if remotion_ok:
+        print(f"[08c] Rendering {len(placements)} B-roll clips with Remotion...")
+        clip_paths = []
+        all_ok = True
+        for idx, p in enumerate(placements):
+            print(f"  [{idx+1}/{len(placements)}] {p['asset']['name']} ({p['duration']:.1f}s)...")
+            clip = render_broll_clip(p, idx, vid_w, vid_h, fps, tmp_dir)
+            clip_paths.append(clip)
+            if clip is None:
+                all_ok = False
+
+        if all_ok or any(c is not None for c in clip_paths):
+            try:
+                print("[08c] Compositing clips onto main video...")
+                composite_broll_clips(
+                    placements, clip_paths, input_video, output_path,
+                    vid_w, vid_h, fps,
+                )
+                # Clean up individual clips
+                for c in clip_paths:
+                    if c and os.path.exists(c):
+                        os.remove(c)
+                print(f"[08c] Output: {output_path}")
+                return output_path
+            except Exception as e:
+                print(f"[08c] Remotion composite failed ({e}), falling back to FFmpeg...")
+    elif os.path.isdir(os.path.join(REMOTION_DIR, "node_modules")):
+        print("[08c] Remotion disabled (set BROLL_USE_REMOTION=1 to enable animated clips).")
+
+    # FFmpeg fallback (direct overlay, no spring animations)
+    print("[08c] Using FFmpeg direct overlay...")
+    apply_broll_ffmpeg(placements, input_video, output_path, vid_w, vid_h)
+    print(f"[08c] Output: {output_path}")
+    return output_path
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python 08c_broll.py <video_path>")
+        sys.exit(1)
+    apply_broll(sys.argv[1])

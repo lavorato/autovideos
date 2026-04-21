@@ -1,0 +1,9 @@
+{
+  "disabled_steps": [
+    "07"
+  ],
+  "enabled_steps": [
+    "05",
+    "06"
+  ]
+}
