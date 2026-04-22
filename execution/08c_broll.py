@@ -482,7 +482,7 @@ def render_broll_clip(placement: dict, idx: int, vid_w: int, vid_h: int,
         "--codec", "h264",
         "--crf", "20",
         "--x264-preset", "veryfast",
-        "--concurrency", "1",
+        "--concurrency", "3",
         "--public-dir", asset_dir,
         "--log", "error",
     ]

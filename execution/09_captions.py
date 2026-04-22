@@ -1,22 +1,52 @@
 """
-Step 9: Add captions using captacity library (https://github.com/unconv/captacity).
-Clean paragraph style with word-level highlighting, centered on face subject.
-Uses pre-computed Whisper transcript from step 01 to skip re-transcription.
+Step 9: Add captions using a Remotion composition (primary) or the captacity
+library (fallback). Clean paragraph style with word-level highlighting,
+centered on face subject. Uses pre-computed Whisper transcript from step 01
+to skip re-transcription.
+
+The Remotion path is 5-10x faster than the old MoviePy/captacity pipeline
+because Chrome headless renders frames in parallel. When the Remotion project
+has no `node_modules`, we transparently fall back to captacity so the step
+still works on a fresh checkout.
+
 Final output goes to output/ directory.
 """
 import sys
 import json
 import os
+import shutil
 import subprocess
 from contextlib import contextmanager
 
 import captacity
+from captacity import segment_parser
 from moviepy import CompositeVideoClip
 
 from video_encoding import (
     build_moviepy_lossless_params,
     first_existing_nonempty_video,
+    _probe_color_metadata,
 )
+
+
+# --- Caption style: Clean Paragraph ---
+FONT = "fonts/OpenSans.ttf"
+FONT_BOLD = "fonts/OpenSans-Bold.ttf"  # Added bold font
+FONT_SIZE = 40
+FONT_COLOR = "white"
+STROKE_WIDTH = 0
+STROKE_COLOR = "black"
+HIGHLIGHT_CURRENT_WORD = True
+WORD_HIGHLIGHT_COLOR = "#FBBF23"  # primary brand color
+LINE_COUNT = 1
+PADDING = 250
+SHADOW_STRENGTH = 0.4
+SHADOW_BLUR = 0.08
+MARGIN_BOTTOM = 1020  # pixels from bottom edge
+
+REMOTION_DIR = os.path.join(os.path.dirname(__file__), "broll-renderer")
+REMOTION_COMPOSITION_ID = "CaptionsComposition"
+USE_REMOTION_DEFAULT = True
 
 
 @contextmanager
@@ -27,7 +57,7 @@ def _captacity_lossless_override(source_video: str):
     lossily and drops the source color tags. Patch the composite clip's write
     method so captacity emits the same lossless x264 export (crf 0, veryslow,
     preserved colorspace/transfer/primaries/range, ALAC audio) used by the
-    other pipeline steps.
+    other pipeline steps. Only used by the captacity fallback path.
     """
     original_write = CompositeVideoClip.write_videofile
     lossless_params = build_moviepy_lossless_params(source_video)
@@ -50,21 +80,6 @@ def _captacity_lossless_override(source_video: str):
         yield
     finally:
         CompositeVideoClip.write_videofile = original_write
-
-# --- Caption style: Clean Paragraph ---
-FONT = "fonts/OpenSans.ttf"
-FONT_BOLD = "fonts/OpenSans-Bold.ttf"  # Added bold font
-FONT_SIZE = 40
-FONT_COLOR = "white"
-STROKE_WIDTH = 0
-STROKE_COLOR = "black"
-HIGHLIGHT_CURRENT_WORD = True
-WORD_HIGHLIGHT_COLOR = "#FBBF23"  # primary brand color
-LINE_COUNT = 1
-PADDING = 250
-SHADOW_STRENGTH = 0.4
-SHADOW_BLUR = 0.08
-MARGIN_BOTTOM = 1020  # pixels from bottom edge
 
 
 def _sanitize_segments_for_captacity(segments):
@@ -105,6 +120,299 @@ def _sanitize_segments_for_captacity(segments):
         seg_copy["end"] = float(seg.get("end", fixed[-1]["end"]))
         clean.append(seg_copy)
     return clean
+
+
+def _probe_video_geometry(video_path: str) -> dict:
+    """Return {fps, width, height, duration} for the given video."""
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,duration",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            video_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(probe.stdout or "{}")
+    stream = (data.get("streams") or [{}])[0] or {}
+    fmt = data.get("format") or {}
+
+    # r_frame_rate is "num/den"; evaluate safely.
+    fps_str = stream.get("r_frame_rate") or "30/1"
+    try:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den) if float(den) else float(num)
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
+
+    duration = stream.get("duration") or fmt.get("duration") or 0.0
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    return {
+        "fps": fps,
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "duration": duration,
+    }
+
+
+def _build_captions_from_transcript(
+    segments: list,
+    font_path: str,
+    video_width: int,
+) -> list:
+    """
+    Run captacity's own line-wrapping logic to turn the WhisperX segments into
+    caption blocks ready for rendering. Each returned caption has fields
+    {text, start, end, words:[{word,start,end}]} — exactly what the Remotion
+    component expects.
+    """
+    fit_function = captacity.fits_frame(
+        LINE_COUNT, font_path, FONT_SIZE, STROKE_WIDTH, video_width - PADDING * 2,
+    )
+    captions = segment_parser.parse(segments=segments, fit_function=fit_function)
+
+    cleaned = []
+    for cap in captions:
+        words = cap.get("words") or []
+        if not words:
+            continue
+        cleaned.append({
+            "text": (cap.get("text") or "").strip(),
+            "start": float(cap.get("start") or words[0]["start"]),
+            "end": float(cap.get("end") or words[-1]["end"]),
+            "words": [
+                {
+                    "word": str(w["word"]),
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                }
+                for w in words
+            ],
+        })
+    return cleaned
+
+
+def _setup_remotion_public_dir(tmp_dir: str, base: str,
+                                source_video: str, font_path: str) -> tuple[str, str, str]:
+    """
+    Build a per-run public dir for Remotion's staticFile resolution. We copy
+    (hardlink when on the same filesystem) both the source video and the bold
+    font into it so Chrome headless can load them via `staticFile(basename)`.
+
+    We intentionally avoid symlinks: Remotion bundles the `--public-dir` into
+    its webpack output without dereferencing, so symlinked entries show up as
+    dangling links inside the bundle and fail with HTTP 404 at render time.
+    Returns (public_dir, video_basename, font_basename).
+    """
+    public_dir = os.path.abspath(os.path.join(tmp_dir, "captions_public", base))
+    if os.path.isdir(public_dir):
+        shutil.rmtree(public_dir, ignore_errors=True)
+    os.makedirs(public_dir, exist_ok=True)
+
+    def _materialize(src: str, dest: str) -> None:
+        src_abs = os.path.abspath(src)
+        if os.path.exists(dest) or os.path.islink(dest):
+            os.remove(dest)
+        # Hardlink is instant and disk-free when src and public_dir are on the
+        # same filesystem; fall back to full copy if not (cross-device or FS
+        # that doesn't support hardlinks).
+        try:
+            os.link(src_abs, dest)
+        except OSError:
+            shutil.copy2(src_abs, dest)
+
+    video_basename = os.path.basename(source_video)
+    font_basename = os.path.basename(font_path)
+
+    _materialize(source_video, os.path.join(public_dir, video_basename))
+    _materialize(font_path, os.path.join(public_dir, font_basename))
+
+    return public_dir, video_basename, font_basename
+
+
+# H.273 numeric codes for common ffprobe color metadata strings. The
+# h264_metadata bitstream filter wants integers here, not names.
+_COLOUR_PRIMARIES_CODES = {
+    "bt709": 1, "unspecified": 2, "bt470m": 4, "bt470bg": 5, "smpte170m": 6,
+    "smpte240m": 7, "film": 8, "bt2020": 9, "smpte428": 10,
+    "smpte431": 11, "smpte432": 12, "jedec-p22": 22,
+}
+_TRANSFER_CODES = {
+    "bt709": 1, "unspecified": 2, "gamma22": 4, "gamma28": 5, "smpte170m": 6,
+    "smpte240m": 7, "linear": 8, "log": 9, "log-sqrt": 10,
+    "iec61966-2-4": 11, "bt1361e": 12, "iec61966-2-1": 13,
+    "bt2020-10": 14, "bt2020-12": 15, "smpte2084": 16, "smpte428": 17,
+    "arib-std-b67": 18,
+}
+_MATRIX_CODES = {
+    "gbr": 0, "bt709": 1, "unspecified": 2, "fcc": 4, "bt470bg": 5,
+    "smpte170m": 6, "smpte240m": 7, "ycgco": 8, "bt2020nc": 9,
+    "bt2020c": 10, "smpte2085": 11, "chroma-derived-nc": 12,
+    "chroma-derived-c": 13, "ictcp": 14,
+}
+
+
+def _color_metadata_bsf_args(source_video: str) -> list[str]:
+    """
+    Build `-bsf:v h264_metadata=...` args that tag the Remotion H.264 output
+    with the source video's color metadata. Returns [] if no tags are known,
+    which lets the remux run as a pure stream-copy.
+    """
+    info = _probe_color_metadata(source_video)
+    kv = []
+
+    primaries = _COLOUR_PRIMARIES_CODES.get((info.get("color_primaries") or "").lower())
+    if primaries is not None:
+        kv.append(f"colour_primaries={primaries}")
+
+    transfer = _TRANSFER_CODES.get((info.get("color_transfer") or "").lower())
+    if transfer is not None:
+        kv.append(f"transfer_characteristics={transfer}")
+
+    matrix = _MATRIX_CODES.get((info.get("color_space") or "").lower())
+    if matrix is not None:
+        kv.append(f"matrix_coefficients={matrix}")
+
+    color_range = (info.get("color_range") or "").lower()
+    if color_range in {"tv", "limited", "mpeg"}:
+        kv.append("video_full_range_flag=0")
+    elif color_range in {"pc", "full", "jpeg"}:
+        kv.append("video_full_range_flag=1")
+
+    if not kv:
+        return []
+    return ["-bsf:v", "h264_metadata=" + ":".join(kv)]
+
+
+def _remux_with_color_tags(remotion_out: str, source_video: str, final_out: str) -> None:
+    """Copy the Remotion output to final_out while tagging color metadata."""
+    bsf_args = _color_metadata_bsf_args(source_video)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", remotion_out,
+        "-c", "copy",
+        "-map", "0",
+        "-movflags", "+faststart",
+        *bsf_args,
+        final_out,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def _remotion_available() -> bool:
+    """Remotion needs node_modules installed in the broll-renderer folder."""
+    return os.path.isdir(os.path.join(REMOTION_DIR, "node_modules"))
+
+
+def _render_with_remotion(
+    input_video: str,
+    captions: list,
+    geometry: dict,
+    font_path: str,
+    output_path: str,
+    tmp_dir: str,
+    base: str,
+) -> None:
+    """Invoke `npx remotion render CaptionsComposition` and remux the result."""
+    public_dir, video_basename, font_basename = _setup_remotion_public_dir(
+        tmp_dir, base, input_video, font_path,
+    )
+
+    duration_frames = max(1, int(round(geometry["duration"] * geometry["fps"])))
+    y_from_bottom = MARGIN_BOTTOM - (FONT_SIZE * LINE_COUNT)
+
+    props = {
+        "fps": int(round(geometry["fps"])),
+        "width": geometry["width"],
+        "height": geometry["height"],
+        "durationInFrames": duration_frames,
+        "mainVideoSrc": video_basename,
+        "fontSrc": font_basename,
+        "captions": captions,
+        "fontSize": FONT_SIZE,
+        "fontColor": "#ffffff" if FONT_COLOR == "white" else FONT_COLOR,
+        "highlightColor": WORD_HIGHLIGHT_COLOR,
+        "shadowStrength": SHADOW_STRENGTH,
+        "shadowBlurPx": float(FONT_SIZE) * SHADOW_BLUR,
+        "yFromBottom": max(0, y_from_bottom),
+        "padding": PADDING,
+    }
+
+    props_path = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions.props.json"))
+    remotion_out = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions_remotion.mp4"))
+
+    with open(props_path, "w", encoding="utf-8") as f:
+        json.dump(props, f, ensure_ascii=False)
+
+    cmd = [
+        "npx", "remotion", "render",
+        "src/index.tsx", REMOTION_COMPOSITION_ID,
+        remotion_out,
+        "--props", props_path,
+        "--codec", "h264",
+        "--crf", "17",
+        "--x264-preset", "veryfast",
+        "--concurrency", "10",
+        "--public-dir", public_dir,
+        "--color-space", "bt709",
+        "--log", "error",
+    ]
+    print(f"[09] Rendering captions via Remotion ({len(captions)} caption blocks, "
+          f"{duration_frames} frames @ {props['fps']}fps)...")
+    subprocess.run(cmd, cwd=REMOTION_DIR, check=True)
+
+    if not os.path.isfile(remotion_out) or os.path.getsize(remotion_out) == 0:
+        raise RuntimeError(f"[09] Remotion produced no output at {remotion_out}")
+
+    print("[09] Applying source color tags...")
+    _remux_with_color_tags(remotion_out, input_video, output_path)
+
+    try:
+        os.remove(remotion_out)
+        os.remove(props_path)
+    except OSError:
+        pass
+
+
+def _render_with_captacity(
+    input_video: str,
+    segments: list | None,
+    geometry: dict,
+    output_path: str,
+) -> None:
+    """Legacy MoviePy/captacity path used as a fallback."""
+    y_pos = geometry["height"] - MARGIN_BOTTOM - (FONT_SIZE * LINE_COUNT)
+
+    print(f"[09] (fallback) Adding captions with captacity: {input_video}")
+    print(f"[09] Style: font={FONT}, font_bold={FONT_BOLD}, "
+          f"size={FONT_SIZE}, highlight={WORD_HIGHLIGHT_COLOR}")
+    print(f"[09] Position: center, y={y_pos}")
+
+    with _captacity_lossless_override(input_video):
+        captacity.add_captions(
+            video_file=input_video,
+            output_file=output_path,
+            font=FONT_BOLD,
+            font_size=FONT_SIZE,
+            font_color=FONT_COLOR,
+            stroke_width=STROKE_WIDTH,
+            stroke_color=STROKE_COLOR,
+            highlight_current_word=HIGHLIGHT_CURRENT_WORD,
+            word_highlight_color=WORD_HIGHLIGHT_COLOR,
+            line_count=LINE_COUNT,
+            padding=PADDING,
+            position=("center", y_pos),
+            shadow_strength=SHADOW_STRENGTH,
+            shadow_blur=SHADOW_BLUR,
+            segments=segments,
+            print_info=True,
+        )
 
 
 def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "output") -> str:
@@ -148,39 +456,55 @@ def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "outp
     else:
         print("[09] No transcript found, captacity will transcribe from scratch")
 
-    # Get video height to calculate bottom position
-    probe = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "stream=height",
-         "-select_streams", "v:0", "-of", "default=noprint_wrappers=1:nokey=1", input_video],
-        capture_output=True, text=True, check=True,
+    geometry = _probe_video_geometry(input_video)
+    print(f"[09] Video geometry: {geometry['width']}x{geometry['height']} "
+          f"@ {geometry['fps']:.3f}fps, {geometry['duration']:.2f}s")
+
+    use_remotion = (
+        os.environ.get("CAPTIONS_USE_REMOTION", "1").strip().lower() in {"1", "true", "yes"}
+        if USE_REMOTION_DEFAULT
+        else os.environ.get("CAPTIONS_USE_REMOTION", "").strip().lower() in {"1", "true", "yes"}
     )
-    vid_height = int(probe.stdout.strip())
-    y_pos = vid_height - MARGIN_BOTTOM - (FONT_SIZE * LINE_COUNT)
 
-    print(f"[09] Adding captions with captacity: {input_video}")
-    print(f"[09] Style: font={FONT}, font_bold={FONT_BOLD}, size={FONT_SIZE}, highlight={WORD_HIGHLIGHT_COLOR}")
-    print(f"[09] Position: center, y={y_pos}")
+    if use_remotion and segments and _remotion_available():
+        try:
+            font_path = captacity.get_font_path(FONT_BOLD)
+            captions = _build_captions_from_transcript(
+                segments=segments,
+                font_path=font_path,
+                video_width=geometry["width"],
+            )
+            if not captions:
+                raise RuntimeError("no caption blocks produced from transcript")
+            _render_with_remotion(
+                input_video=input_video,
+                captions=captions,
+                geometry=geometry,
+                font_path=font_path,
+                output_path=output_path,
+                tmp_dir=tmp_dir,
+                base=base,
+            )
+            print(f"[09] Final output: {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as exc:
+            print(f"[09] Remotion render failed (exit {exc.returncode}), "
+                  f"falling back to captacity...")
+        except Exception as exc:
+            print(f"[09] Remotion render failed ({exc}), falling back to captacity...")
+    elif use_remotion and not _remotion_available():
+        print(f"[09] Remotion not installed at {REMOTION_DIR} (no node_modules), "
+              f"using captacity fallback.")
+    elif use_remotion and not segments:
+        print("[09] No sanitized transcript available, using captacity fallback "
+              "so it can transcribe from scratch.")
 
-    with _captacity_lossless_override(input_video):
-        captacity.add_captions(
-            video_file=input_video,
-            output_file=output_path,
-            font=FONT_BOLD,
-            font_size=FONT_SIZE,
-            font_color=FONT_COLOR,
-            stroke_width=STROKE_WIDTH,
-            stroke_color=STROKE_COLOR,
-            highlight_current_word=HIGHLIGHT_CURRENT_WORD,
-            word_highlight_color=WORD_HIGHLIGHT_COLOR,
-            line_count=LINE_COUNT,
-            padding=PADDING,
-            position=("center", y_pos),
-            shadow_strength=SHADOW_STRENGTH,
-            shadow_blur=SHADOW_BLUR,
-            segments=segments,
-            print_info=True,
-        )
-
+    _render_with_captacity(
+        input_video=input_video,
+        segments=segments,
+        geometry=geometry,
+        output_path=output_path,
+    )
     print(f"[09] Final output: {output_path}")
     return output_path
 
