@@ -21,26 +21,74 @@ import json
 import subprocess
 import re
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
-from video_encoding import build_lossless_x264_args, first_existing_nonempty_video
+from video_encoding import (
+    build_fast_hq_x264_args,
+    first_existing_nonempty_video,
+    _probe_color_metadata,
+)
+
+
+def _build_color_preserving_encode_args(main_video: str) -> list[str]:
+    """Encoder args for the B-roll composite pass that do NOT shift colors.
+
+    We intentionally avoid `h264_videotoolbox` here: on macOS builds it
+    silently drops color_primaries / color_trc / colorspace tags and bakes
+    in a BT.709 assumption, which produces a visible color shift vs. the
+    source after this step re-encodes the whole main video. libx264 at
+    crf 16 is visually lossless for an intermediate pipeline step and
+    keeps the source color tags intact.
+    """
+    return build_fast_hq_x264_args(main_video, crf=16, preset="veryfast")
+
+
+def _source_color_filter(video_path: str) -> str:
+    """Build a filter chain fragment that normalizes pixel format to yuv420p
+    and re-applies the source's color tags, so the FFmpeg overlay pass can't
+    silently renegotiate colorspace on us."""
+    info = _probe_color_metadata(video_path)
+    parts = ["format=yuv420p"]
+
+    mapping = {
+        "color_primaries": "color_primaries",
+        "color_trc": "color_trc",
+        "colorspace": "color_space",
+        "range": "color_range",
+    }
+    setparams_kv = []
+    for ff_key, src_key in mapping.items():
+        value = info.get(src_key)
+        if value and value != "unknown":
+            setparams_kv.append(f"{ff_key}={value}")
+    if setparams_kv:
+        parts.append("setparams=" + ":".join(setparams_kv))
+    return ",".join(parts)
 
 # --- Config ---
 MIN_BROLL_DURATION = 3.0  # seconds minimum per b-roll
 MAX_BROLL_DURATION = 6.0  # seconds max per b-roll
 SPLIT_RATIO = 0.45        # how much of the frame the b-roll takes
 # FFmpeg scale/crop require strictly positive width/height; margins shrink on small frames.
-MIN_BROLL_PANEL = 2  # minimum split panel size (px) along the short axis
-BROLL_MARGIN_CAP = 16
+MIN_BROLL_PANEL = 0  # minimum split panel size (px) along the short axis
+BROLL_MARGIN_CAP = 0
 REMOTION_DIR = os.path.join(os.path.dirname(__file__), "broll-renderer")
-USE_REMOTION_BY_DEFAULT = False  # Remotion can render black clips with local assets.
+USE_REMOTION_BY_DEFAULT = True
+
+# How many Remotion clip renders to run concurrently. Each Remotion render
+# spins up a Chrome headless instance (~400MB RAM), so keep this modest on
+# laptops. Override via env BROLL_REMOTION_WORKERS.
+DEFAULT_REMOTION_WORKERS = 3
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 
-ANIMATIONS = ["slide-left", "slide-right", "slide-up", "scale-in"]
-POSITIONS = ["top", "bottom"]
+ANIMATIONS = [ "none"]
+# POSITIONS = ["top", "bottom"]
+POSITIONS = ["bottom"]
 MAX_LLM_SEGMENTS = 80
 MAX_LLM_SEGMENT_TEXT = 220
+MAX_LLM_NEIGHBOR_TEXT = 100
 
 
 def find_assets(video_path: str) -> list:
@@ -113,7 +161,19 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
-def suggest_segments_with_openrouter(assets: list, segments: list, models: list[str]) -> tuple[dict, str | None]:
+def _snippet(s: str, max_len: int) -> str:
+    t = (s or "").strip()
+    if len(t) <= max_len:
+        return t
+    return t[:max_len].rstrip() + "..."
+
+
+def suggest_segments_with_openrouter(
+    assets: list,
+    segments: list,
+    models: list[str],
+    video_duration_sec: float,
+) -> tuple[dict, str | None]:
     """
     Use OpenRouter LLM to map asset filenames to transcript segment indices.
     Returns (asset_name -> segment_index, model_used). Empty map on failure.
@@ -123,30 +183,54 @@ def suggest_segments_with_openrouter(assets: list, segments: list, models: list[
 
     # Limit transcript payload to keep token usage predictable.
     payload_segments = []
-    for idx, seg in enumerate(segments[:MAX_LLM_SEGMENTS]):
+    capped = segments[:MAX_LLM_SEGMENTS]
+    n_cap = len(capped)
+    for idx, seg in enumerate(capped):
         text = seg.get("text", "").strip()
         if len(text) > MAX_LLM_SEGMENT_TEXT:
             text = text[:MAX_LLM_SEGMENT_TEXT] + "..."
+
+        seg_end = float(seg.get("end", seg.get("start", 0.0)))
+        until_end = max(0.0, float(video_duration_sec) - seg_end)
+
+        prev_text = ""
+        if idx > 0:
+            prev_text = _snippet(capped[idx - 1].get("text", ""), MAX_LLM_NEIGHBOR_TEXT)
+        next_text = ""
+        if idx + 1 < n_cap:
+            next_text = _snippet(capped[idx + 1].get("text", ""), MAX_LLM_NEIGHBOR_TEXT)
+
         payload_segments.append({
             "index": idx,
             "start": round(float(seg.get("start", 0.0)), 3),
+            "end": round(seg_end, 3),
             "text": text,
+            "context_before": prev_text,
+            "context_after": next_text,
+            "seconds_until_video_end": round(until_end, 2),
         })
 
     asset_names = [a["name"] for a in assets]
 
     system_prompt = (
-        "You place B-roll assets onto transcript segments. "
+        "You map B-roll assets to transcript segments. Use each segment's text plus "
+        "context_before and context_after to understand what is being said and what comes next. "
+        "Use seconds_until_video_end to treat late-video speech (sign-offs, CTAs, thanks, "
+        "subscribe prompts, housekeeping) as low-value for illustrative B-roll unless the "
+        "asset clearly belongs there. Prefer segments where the asset visually supports the "
+        "main idea; use null when no segment needs that asset or only weak filler matches exist. "
         "Return strict JSON only."
     )
     user_prompt = (
-        "Choose the best transcript segment for each asset.\n"
-        "Use semantic meaning from filenames and transcript text.\n"
-        "If no good segment exists, use null.\n\n"
+        "Choose the best transcript segment index for each asset.\n"
+        "Match filename meaning to the spoken content; use neighbor context to avoid "
+        "ambiguous picks. Do not force a match into outros or generic closing chatter.\n"
+        "If no good segment exists, use null for segment_index.\n\n"
         "Return exactly this JSON schema:\n"
         '{ "matches": [ { "asset": "filename.ext", "segment_index": 0, "confidence": 0.0 } ] }\n'
         "- segment_index must be null or an integer from the provided segment list.\n"
         "- confidence must be between 0 and 1.\n\n"
+        f"video_duration_sec: {round(float(video_duration_sec), 3)}\n\n"
         f"Assets:\n{json.dumps(asset_names, ensure_ascii=False)}\n\n"
         f"Segments:\n{json.dumps(payload_segments, ensure_ascii=False)}"
     )
@@ -237,6 +321,7 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
                 assets=assets,
                 segments=sorted_segments,
                 models=candidate_models,
+                video_duration_sec=video_duration,
             )
         else:
             print("[08c] OPENROUTER_API_KEY found, but no OPENROUTER_MODEL(S) configured.")
@@ -340,57 +425,131 @@ def calc_broll_dimensions(pos: str, vid_w: int, vid_h: int) -> tuple:
 
 def render_broll_clip(placement: dict, idx: int, vid_w: int, vid_h: int,
                       fps: float, tmp_dir: str) -> str | None:
-    """Render a single B-roll clip with Remotion at the B-roll's own dimensions."""
+    """Render a single B-roll clip with Remotion at the B-roll's own dimensions.
+
+    Uses Remotion's `--public-dir` feature pointing at the asset's parent
+    folder so `staticFile(assetName)` resolves to a URL Chrome can fetch
+    (the previous implementation passed raw absolute paths, which Chrome
+    could not load — that caused the composition to render a solid black
+    background for the entire clip)."""
     inner_w, inner_h, _, _ = calc_broll_dimensions(
         placement["position"], vid_w, vid_h
     )
 
+    asset_path = placement["asset"]["path"]
+    asset_dir = os.path.dirname(os.path.abspath(asset_path))
+    asset_name = os.path.basename(asset_path)
+
+    duration_frames = max(1, int(round(placement["duration"] * fps)))
+
     config = {
-        "fps": int(fps),
+        "fps": int(round(fps)),
         "width": inner_w,
         "height": inner_h,
-        "durationInFrames": int(placement["duration"] * fps),
+        "durationInFrames": duration_frames,
         "mainVideoSrc": "",
         "segments": [{
-            "assetPath": placement["asset"]["path"],
+            "assetName": asset_name,
             "assetType": placement["asset"]["type"],
             "startFrame": 0,
-            "durationFrames": int(placement["duration"] * fps),
+            "durationFrames": duration_frames,
             "animation": placement["animation"],
             "splitRatio": SPLIT_RATIO,
             "position": placement["position"],
         }],
     }
 
-    config_path = os.path.abspath(os.path.join(tmp_dir, f"broll_clip_{idx}.json"))
+    props_path = os.path.abspath(os.path.join(tmp_dir, f"broll_clip_{idx}.props.json"))
     output_path = os.path.abspath(os.path.join(tmp_dir, f"broll_clip_{idx}.mp4"))
 
-    with open(config_path, "w") as f:
+    # Pass the config via --props so it survives BOTH the Node composition
+    # scan AND the in-browser render. Reading the file from disk inside
+    # index.tsx silently fails inside Chrome headless (no `fs` module), which
+    # is what caused every clip to render black before this change.
+    with open(props_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    env = os.environ.copy()
-    env["BROLL_CONFIG"] = config_path
-
+    # Visually-lossless H.264 with a fast preset. The clip will be overlayed
+    # by FFmpeg in composite_broll_clips() which re-encodes the final video,
+    # so there's no point spending minutes on a high-effort preset here.
+    # Keep Remotion's own concurrency at 1 because we parallelize clips from
+    # Python via ThreadPoolExecutor (multiple Chrome instances in parallel).
     cmd = [
         "npx", "remotion", "render",
         "src/index.tsx", "BrollComposition",
         output_path,
+        "--props", props_path,
         "--codec", "h264",
-        "--crf", "0",
-        "--x264-preset", "veryslow",
+        "--crf", "20",
+        "--x264-preset", "veryfast",
+        "--concurrency", "1",
+        "--public-dir", asset_dir,
         "--log", "error",
     ]
-    result = subprocess.run(
-        cmd, cwd=REMOTION_DIR, env=env,
-        capture_output=True, text=True, timeout=300,
-    )
-    if result.returncode != 0:
-        print(f"  Remotion clip {idx} failed: {result.stderr[-300:]}")
+    try:
+        result = subprocess.run(
+            cmd, cwd=REMOTION_DIR,
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  Remotion clip {idx} timed out")
         return None
 
-    # Clean up config
-    os.remove(config_path)
+    if result.returncode != 0:
+        err = (result.stderr or "") + "\n" + (result.stdout or "")
+        print(f"  Remotion clip {idx} failed (exit {result.returncode}):")
+        for line in err.strip().splitlines()[-30:]:
+            print(f"    {line}")
+        return None
+
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        print(f"  Remotion clip {idx} produced no output")
+        return None
+
+    try:
+        os.remove(props_path)
+    except OSError:
+        pass
     return output_path
+
+
+def _render_clips_parallel(placements: list, vid_w: int, vid_h: int,
+                           fps: float, tmp_dir: str,
+                           max_workers: int) -> list:
+    """Render all B-roll clips with Remotion in parallel.
+
+    Preserves input ordering in the returned list (clip N -> result[N]),
+    but completes work out of order so progress prints reflect wall-clock
+    finish order, not submission order."""
+    total = len(placements)
+    results: list = [None] * total
+    if total == 0:
+        return results
+
+    workers = max(1, min(max_workers, total))
+    print(f"[08c] Rendering {total} B-roll clips with Remotion "
+          f"(parallel workers={workers})...")
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_to_idx = {
+            ex.submit(render_broll_clip, p, i, vid_w, vid_h, fps, tmp_dir): i
+            for i, p in enumerate(placements)
+        }
+        done = 0
+        for fut in as_completed(future_to_idx):
+            i = future_to_idx[fut]
+            name = placements[i]["asset"]["name"]
+            try:
+                results[i] = fut.result()
+            except Exception as exc:
+                print(f"  [{done + 1}/{total}] {name} ERROR: {exc}")
+                results[i] = None
+            else:
+                status = "ok" if results[i] else "failed"
+                done_dur = placements[i]["duration"]
+                print(f"  [{done + 1}/{total}] {name} ({done_dur:.1f}s) {status}")
+            done += 1
+    return results
 
 
 def composite_broll_clips(placements: list, clip_paths: list,
@@ -400,7 +559,13 @@ def composite_broll_clips(placements: list, clip_paths: list,
     Each clip is already rendered at the correct B-roll dimensions by Remotion."""
     inputs = ["-i", main_video]
     filter_parts = []
-    current_label = "[0:v]"
+
+    # Lock the main video into yuv420p with its original color tags so the
+    # overlay filter can't implicitly renegotiate colorspace between the
+    # main video and the Remotion clips (which are bt709 yuv420p).
+    src_fmt = _source_color_filter(main_video)
+    filter_parts.append(f"[0:v]{src_fmt}[bg]")
+    current_label = "[bg]"
 
     clip_idx = 0
     for idx, p in enumerate(placements):
@@ -418,18 +583,22 @@ def composite_broll_clips(placements: list, clip_paths: list,
         scale_label = f"s{idx}"
         overlay_label = f"[ov{idx}]"
 
-        # Shift the clip to its timeline slot so it is still alive at start_t.
+        # Force the clip to yuv420p too, then shift it to its timeline slot
+        # so it's still alive at start_t.
         filter_parts.append(
-            f"[{inp}:v]setpts=PTS-STARTPTS+{start_t}/TB[{scale_label}]"
+            f"[{inp}:v]format=yuv420p,"
+            f"setpts=PTS-STARTPTS+{start_t}/TB[{scale_label}]"
         )
         filter_parts.append(
             f"{current_label}[{scale_label}]overlay={x}:{y}:"
-            f"enable='between(t,{start_t},{end_t})':eof_action=pass"
+            f"enable='between(t,{start_t},{end_t})':eof_action=pass:"
+            f"format=auto"
             f"{overlay_label}"
         )
         current_label = overlay_label
 
-    if not filter_parts:
+    if len(filter_parts) == 1:
+        # Only the color-tag passthrough, no successful clips rendered.
         subprocess.run(["cp", main_video, output_path], check=True)
         return output_path
 
@@ -437,7 +606,7 @@ def composite_broll_clips(placements: list, clip_paths: list,
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", current_label, "-map", "0:a",
-        *build_lossless_x264_args(main_video),
+        *_build_color_preserving_encode_args(main_video),
         "-c:a", "copy",
         output_path,
     ]
@@ -462,7 +631,13 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
         inputs.extend(["-i", p["asset"]["path"]])
 
     filter_parts = []
-    current_label = "[0:v]"
+
+    # Same color-preserving preamble as composite_broll_clips — force the
+    # main video into a known pixel format with the source's color tags so
+    # overlay cannot auto-negotiate into a slightly different colorspace.
+    src_fmt = _source_color_filter(main_video)
+    filter_parts.append(f"[0:v]{src_fmt}[bg]")
+    current_label = "[bg]"
 
     for idx, p in enumerate(placements):
         inp_idx = idx + 1
@@ -473,11 +648,11 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
         inner_w, inner_h, x, y = calc_broll_dimensions(pos, main_w, main_h)
 
         scale_label = f"scaled{idx}"
-        # Shift the clip to its timeline slot so enable=between(t,...) can show it.
         filter_parts.append(
             f"[{inp_idx}:v]scale={inner_w}:{inner_h}:"
             f"force_original_aspect_ratio=increase,"
             f"crop={inner_w}:{inner_h},"
+            f"format=yuv420p,"
             f"setpts=PTS-STARTPTS+{start_t}/TB"
             f"[{scale_label}]"
         )
@@ -485,7 +660,8 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
         overlay_label = f"[ov{idx}]"
         filter_parts.append(
             f"{current_label}[{scale_label}]overlay={x}:{y}:"
-            f"enable='between(t,{start_t},{end_t})':eof_action=pass"
+            f"enable='between(t,{start_t},{end_t})':eof_action=pass:"
+            f"format=auto"
             f"{overlay_label}"
         )
         current_label = overlay_label
@@ -494,7 +670,7 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", current_label, "-map", "0:a",
-        *build_lossless_x264_args(main_video),
+        *_build_color_preserving_encode_args(main_video),
         "-c:a", "copy",
         output_path,
     ]
@@ -591,7 +767,7 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
     # then overlay all clips onto the main video with FFmpeg.
     # Falls back to direct FFmpeg overlay (simpler, no spring animations) if Remotion fails.
     remotion_enabled = (
-        os.environ.get("BROLL_USE_REMOTION", "").strip().lower() in {"1", "true", "yes"}
+        os.environ.get("BROLL_USE_REMOTION", "1").strip().lower() in {"1", "true", "yes"}
     )
     remotion_ok = (
         remotion_enabled
@@ -602,17 +778,18 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
         remotion_ok = os.path.isdir(os.path.join(REMOTION_DIR, "node_modules"))
 
     if remotion_ok:
-        print(f"[08c] Rendering {len(placements)} B-roll clips with Remotion...")
-        clip_paths = []
-        all_ok = True
-        for idx, p in enumerate(placements):
-            print(f"  [{idx+1}/{len(placements)}] {p['asset']['name']} ({p['duration']:.1f}s)...")
-            clip = render_broll_clip(p, idx, vid_w, vid_h, fps, tmp_dir)
-            clip_paths.append(clip)
-            if clip is None:
-                all_ok = False
+        try:
+            max_workers = int(os.environ.get(
+                "BROLL_REMOTION_WORKERS", str(DEFAULT_REMOTION_WORKERS)
+            ))
+        except ValueError:
+            max_workers = DEFAULT_REMOTION_WORKERS
 
-        if all_ok or any(c is not None for c in clip_paths):
+        clip_paths = _render_clips_parallel(
+            placements, vid_w, vid_h, fps, tmp_dir, max_workers=max_workers,
+        )
+
+        if any(c is not None for c in clip_paths):
             try:
                 print("[08c] Compositing clips onto main video...")
                 composite_broll_clips(

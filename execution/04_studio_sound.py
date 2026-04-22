@@ -9,8 +9,17 @@ import subprocess
 
 def apply_studio_sound(video_path: str, tmp_dir: str = ".tmp") -> str:
     base = os.path.splitext(os.path.basename(video_path))[0]
-    input_video = os.path.join(tmp_dir, f"{base}_no_fillers.mp4")
-    if not os.path.exists(input_video):
+    # Prefer the voice-isolated track from Step 3b if available, so EQ/compression
+    # operate on a clean vocals stem instead of noisy raw audio. Fall back through
+    # the normal chain if the isolation step was skipped.
+    for candidate in (
+        os.path.join(tmp_dir, f"{base}_voice.mp4"),
+        os.path.join(tmp_dir, f"{base}_no_fillers.mp4"),
+    ):
+        if os.path.exists(candidate):
+            input_video = candidate
+            break
+    else:
         input_video = video_path
     output_path = os.path.join(tmp_dir, f"{base}_studio.mp4")
 

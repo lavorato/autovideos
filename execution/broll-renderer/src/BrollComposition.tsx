@@ -5,16 +5,22 @@ import {
   Sequence,
   interpolate,
   spring,
+  staticFile,
   useCurrentFrame,
   useVideoConfig,
 } from "remotion";
 
-type BrollSegment = {
-  assetPath: string;
+export type BrollSegment = {
+  /**
+   * Filename (basename only) of the asset inside the configured public dir.
+   * The Python side passes `--public-dir` pointing at `input/<base>/`, so
+   * `staticFile(assetName)` resolves to a URL that Chrome can actually fetch.
+   */
+  assetName: string;
   assetType: "video" | "image";
   startFrame: number;
   durationFrames: number;
-  animation: "slide-left" | "slide-right" | "slide-up" | "scale-in";
+  animation: "slide-left" | "slide-right" | "slide-up" | "scale-in" | "none";
   splitRatio: number;
   position: "left" | "right" | "top" | "bottom";
 };
@@ -22,6 +28,13 @@ type BrollSegment = {
 type Props = {
   segments: BrollSegment[];
   mainVideoSrc: string;
+  // Metadata fields (also consumed by calculateMetadata in index.tsx).
+  // They're unused inside the component but must exist on the props type
+  // so Remotion accepts them in inputProps without prop-type errors.
+  fps?: number;
+  width?: number;
+  height?: number;
+  durationInFrames?: number;
 };
 
 /**
@@ -53,7 +66,6 @@ const AnimatedBroll: React.FC<{ segment: BrollSegment }> = ({ segment }) => {
 
   const progress = enterProgress * (1 - exitProgress);
 
-  // Slide/scale animation within the clip's own frame
   let transform = "";
   switch (segment.animation) {
     case "slide-left":
@@ -65,11 +77,16 @@ const AnimatedBroll: React.FC<{ segment: BrollSegment }> = ({ segment }) => {
     case "slide-up":
       transform = `translateY(${interpolate(progress, [0, 1], [height, 0])}px)`;
       break;
-    case "scale-in": {
+    case "scale-in":
       const scale = interpolate(progress, [0, 1], [0.3, 1]);
       transform = `scale(${scale})`;
       break;
-    }
+    case "none":
+      transform = "";
+      break;
+    default:
+      transform = "";
+      break;
   }
 
   const mediaStyle: React.CSSProperties = {
@@ -78,40 +95,44 @@ const AnimatedBroll: React.FC<{ segment: BrollSegment }> = ({ segment }) => {
     objectFit: "cover",
   };
 
-  // Subtle Ken Burns on images
   const kenBurns =
     segment.assetType === "image"
       ? `scale(${interpolate(frame, [0, segment.durationFrames], [1, 1.08])})`
       : "";
 
+  const src = staticFile(segment.assetName);
+
   return (
     <AbsoluteFill
       style={{
-        backgroundColor: "#111",
+        backgroundColor: "transparent",
         overflow: "hidden",
-        borderRadius: 24,
+        borderRadius: 0,
         transform,
       }}
     >
-      {/* Media content */}
-      <div style={{ width: "100%", height: "100%", overflow: "hidden", borderRadius: 24 }}>
+      <div
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "hidden",
+          borderRadius: 0,
+        }}
+      >
         {segment.assetType === "video" ? (
-          <OffthreadVideo src={segment.assetPath} style={mediaStyle} />
+          <OffthreadVideo src={src} style={mediaStyle} muted />
         ) : (
-          <Img
-            src={segment.assetPath}
-            style={{ ...mediaStyle, transform: kenBurns }}
-          />
+          <Img src={src} style={{ ...mediaStyle, transform: kenBurns }} />
         )}
       </div>
-      {/* Glassmorphism border */}
       <div
         style={{
           position: "absolute",
           inset: 0,
-          borderRadius: 24,
+          borderRadius: 0,
           border: "2px solid rgba(255,255,255,0.25)",
-          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.1), 0 8px 32px rgba(0,0,0,0.5)",
+          boxShadow:
+            "inset 0 1px 0 rgba(255,255,255,0.1), 0 8px 32px rgba(0,0,0,0.5)",
           pointerEvents: "none",
         }}
       />
@@ -121,9 +142,13 @@ const AnimatedBroll: React.FC<{ segment: BrollSegment }> = ({ segment }) => {
 
 export const BrollComposition: React.FC<Props> = ({ segments }) => {
   return (
-    <AbsoluteFill style={{ backgroundColor: "#111" }}>
+    <AbsoluteFill style={{ backgroundColor: "transparent" }}>
       {segments.map((seg, i) => (
-        <Sequence key={i} from={seg.startFrame} durationInFrames={seg.durationFrames}>
+        <Sequence
+          key={i}
+          from={seg.startFrame}
+          durationInFrames={seg.durationFrames}
+        >
           <AnimatedBroll segment={seg} />
         </Sequence>
       ))}

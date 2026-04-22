@@ -18,6 +18,14 @@ import sys
 # Same path setup as run_pipeline.py
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Load root .env before any step modules are imported.
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    load_dotenv(_ENV_PATH, override=False)
+except ImportError:
+    pass
+
 import run_pipeline as rp
 from importlib import import_module
 

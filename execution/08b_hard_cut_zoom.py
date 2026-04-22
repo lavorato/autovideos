@@ -9,21 +9,31 @@ import sys
 import os
 import json
 import math
+import platform
 import numpy as np
 import cv2
 import subprocess
-from video_encoding import build_lossless_x264_args
+from video_encoding import build_fast_pipeline_encode_args
 
 # --- Config ---
 CUT_INTERVAL = 5.0       # seconds between each hard cut
 ZOOM_LEVEL = 1.4         # how much to zoom in on tight shots
-FACE_SAMPLE_FPS = 5.0    # frames/sec to sample for face detection
+FACE_SAMPLE_FPS = 2.0    # frames/sec to sample for face detection (locked-per-segment
+                         # only needs ~1 sample per segment; we keep a small margin).
 FACE_FOLLOW = False      # True = camera follows face each frame (smooth tracking)
                          # False = zoom locks to face position at segment start (static zoom)
+FACE_DETECT_MAX_DIM = 480  # downscale for Haar detection (was 640)
 
 
 def detect_face_positions(video_path: str, sample_fps: float = FACE_SAMPLE_FPS) -> tuple:
     """Sample frames and detect face center positions using Haar cascade.
+
+    Performance notes:
+      - We only *decode* frames we actually sample. `cap.grab()` advances the
+        decoder without doing a full frame decode/colour-convert (roughly 5-10x
+        cheaper than `cap.read()` on 4K HEVC). This turns the detection pass from
+        "decode every frame" into "decode only the ~sample_fps subset".
+      - The sampled frame is downscaled once to FACE_DETECT_MAX_DIM before Haar.
 
     Returns first_frame_wh as (w, h) from the first decoded frame when available;
     this can disagree with container/stream metadata (e.g. some iPhone HEVC).
@@ -34,42 +44,56 @@ def detect_face_positions(video_path: str, sample_fps: float = FACE_SAMPLE_FPS) 
     )
 
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    sample_interval = max(1, int(fps / sample_fps))
-    positions = []
+    sample_interval = max(1, int(round(fps / max(0.1, sample_fps))))
+    positions: list = []
     first_frame_wh: tuple[int, int] | None = None
 
+    detect_scale = min(1.0, float(FACE_DETECT_MAX_DIM) / max(1, max(width, height)))
+
     frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if first_frame_wh is None:
-            first_frame_wh = (int(frame.shape[1]), int(frame.shape[0]))
+    while True:
         if frame_idx % sample_interval == 0:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if first_frame_wh is None:
+                first_frame_wh = (int(frame.shape[1]), int(frame.shape[0]))
             t = frame_idx / fps
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Scale down for faster detection
-            scale = min(1.0, 640.0 / max(width, height))
-            small = cv2.resize(gray, None, fx=scale, fy=scale)
-            faces = face_cascade.detectMultiScale(small, 1.1, 5, minSize=(30, 30))
+            if detect_scale < 1.0:
+                small = cv2.resize(
+                    frame, None, fx=detect_scale, fy=detect_scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                small = frame
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
 
             cx, cy = 0.5, 0.5
             if len(faces) > 0:
-                # Pick largest face
                 largest = max(faces, key=lambda f: f[2] * f[3])
                 fx, fy, fw, fh = largest
-                cx = (fx + fw / 2) / small.shape[1]
-                cy = (fy + fh / 2) / small.shape[0]
+                cx = (fx + fw / 2) / gray.shape[1]
+                cy = (fy + fh / 2) / gray.shape[0]
 
-            positions.append({"time": t, "cx": cx, "cy": cy})
+            positions.append({"time": t, "cx": float(cx), "cy": float(cy)})
+        else:
+            if not cap.grab():
+                break
         frame_idx += 1
+        if total_frames and frame_idx >= total_frames:
+            break
 
     cap.release()
-    print(f"[08b] Sampled {len(positions)} face positions")
+    print(
+        f"[08b] Sampled {len(positions)} face positions "
+        f"(every {sample_interval} frame(s) at {fps:.2f} fps input)"
+    )
     return positions, width, height, fps, first_frame_wh
 
 
@@ -234,17 +258,40 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
     # FFmpeg picks muxer from the file extension; "foo.mp4.part" fails — use "foo.part.mp4".
     root, ext = os.path.splitext(output_path)
     output_partial = f"{root}.part{ext}"
+
+    # Hardware-accelerated decode on macOS gives a large speedup on iPhone HEVC,
+    # which is the dominant input format. Opt out with FFMPEG_HWACCEL=none.
+    hwaccel_args: list[str] = []
+    hwaccel_pref = os.environ.get("FFMPEG_HWACCEL", "").lower()
+    if hwaccel_pref != "none" and platform.system() == "Darwin":
+        hwaccel_args = ["-hwaccel", "videotoolbox"]
+
+    encoder_args = build_fast_pipeline_encode_args(input_video)
+    encoder_name = encoder_args[1] if len(encoder_args) > 1 else "unknown"
+    print(f"[08b] Encoder: {encoder_name}  hwaccel: {hwaccel_args[-1] if hwaccel_args else 'none'}")
+
     ffmpeg_cmd = [
         "ffmpeg", "-y",
+        *hwaccel_args,
+        # Coded dimensions must match ffprobe WxH; otherwise display-matrix
+        # rotation yields e.g. 2160x3840 in filters while we scale to 3840x2160,
+        # and concat fails (wide vs zoomed branch size mismatch).
+        "-noautorotate",
         "-i", input_video,
         "-filter_complex", filter_complex,
         "-map", "[vout]", "-map", "0:a?",
-        *build_lossless_x264_args(input_video),
+        *encoder_args,
         "-c:a", "copy",
+        "-movflags", "+faststart",
         "-shortest",
         output_partial,
     ]
     run = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    if run.returncode != 0 and hwaccel_args:
+        # VideoToolbox decode can fail on unusual pixel formats; retry in software.
+        print("[08b] Hardware decode failed, retrying with software decode...")
+        fallback = [a for a in ffmpeg_cmd if a not in hwaccel_args]
+        run = subprocess.run(fallback, capture_output=True, text=True)
     if run.returncode != 0:
         if os.path.exists(output_partial):
             try:

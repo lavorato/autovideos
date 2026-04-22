@@ -26,13 +26,25 @@ import traceback
 # Add execution dir to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Load environment variables from the repo-root .env as early as possible,
+# so every step module (imported below) sees OPENROUTER_API_KEY, WHISPERX_*,
+# BROLL_*, etc. regardless of the current working directory.
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    load_dotenv(_ENV_PATH, override=False)
+except ImportError:
+    pass
+
 from importlib import import_module
 
 # All steps in pipeline order. "enabled" is the default state.
 ALL_STEPS = [
+    {"id": "00", "module": "00_convert_source",   "func": "convert_source",      "label": "Convert Source",     "enabled": True},
     {"id": "01", "module": "01_transcribe",       "func": "transcribe",          "label": "Transcription",      "enabled": True},
     {"id": "02", "module": "02_remove_retakes",   "func": "remove_retakes",      "label": "Remove Retakes",     "enabled": True},
     {"id": "03", "module": "03_remove_fillers",   "func": "remove_fillers",      "label": "Remove Fillers",     "enabled": True},
+    {"id": "03b","module": "03b_isolate_voice",   "func": "isolate_voice",       "label": "Isolate Voice",      "enabled": True},
     {"id": "04", "module": "04_studio_sound",     "func": "apply_studio_sound",  "label": "Studio Sound",       "enabled": True},
     {"id": "05", "module": "05_fix_mute",         "func": "fix_mute",            "label": "Fix Mute Gaps",      "enabled": True},
     {"id": "06", "module": "06_split_scenes",     "func": "split_scenes",        "label": "Scene Detection",    "enabled": True},
@@ -46,6 +58,52 @@ ALL_STEPS = [
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "pipeline_config.json")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs", "pipeline")
+STEP_OUTPUT_PATTERNS = {
+    "01": [".tmp/{base}_transcript.json"],
+    "02": [".tmp/{base}_no_retakes.mp4"],
+    "03": [".tmp/{base}_no_fillers.mp4"],
+    "03b": [".tmp/{base}_voice.mp4"],
+    "04": [".tmp/{base}_studio.mp4"],
+    "05": [".tmp/{base}_fixed_audio.mp4"],
+    "06": [".tmp/{base}_scenes.json"],
+    "07": [".tmp/{base}_color.mp4"],
+    "08": [".tmp/{base}_effects.mp4"],
+    "08b": [".tmp/{base}_hardcut.mp4"],
+    "08c": [".tmp/{base}_broll.mp4"],
+    "09": ["output/{base}_final.mp4"],
+    "10": ["output/{base}_final.mp4"],
+}
+
+
+class TeeStream:
+    """Write stream output to multiple targets (terminal + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        primary = self.streams[0]
+        return getattr(primary, "isatty", lambda: False)()
+
+    def __getattr__(self, attr):
+        # Keep compatibility with normal text streams.
+        return getattr(self.streams[0], attr)
+
+
+def build_log_file_path() -> str:
+    """Create a timestamped pipeline log file path."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.abspath(os.path.join(LOGS_DIR, f"run-{timestamp}.log"))
 
 
 # ── Config persistence ────────────────────────────────────────
@@ -138,20 +196,22 @@ def find_videos(input_dir: str = "input") -> list:
 
 
 def run_step(step: dict, video_path: str):
+    """Run one pipeline step. Returns (ok, result) where result is whatever
+    the step callable returned (usually an output file path, sometimes None)."""
     module_name, func_name, label = step["module"], step["func"], step["label"]
     print(f"\n--- [{step['id']}] {label} ---")
     start = time.time()
     try:
         mod = import_module(module_name)
         func = getattr(mod, func_name)
-        func(video_path)
+        result = func(video_path)
         elapsed = time.time() - start
         print(f"  Completed in {elapsed:.1f}s")
-        return True
+        return True, result
     except Exception as e:
         print(f"  ERROR: {e}")
         traceback.print_exc()
-        return False
+        return False, None
 
 
 def expected_outputs_for_step(step: dict, video_path: str) -> list:
@@ -204,7 +264,19 @@ def process_video(video_path: str, steps: list, do_clean: bool = False, verify_o
     start_total = time.time()
     all_ok = True
     for step in steps:
-        step_ok = run_step(step, video_path)
+        step_ok, step_result = run_step(step, video_path)
+        # Step 00 transcodes the source to a smaller .mp4; swap the active
+        # video_path so every downstream step operates on the lighter file.
+        # The output keeps the original basename (e.g. .tmp/IMG_1792.mp4),
+        # so .tmp/{base}_*.* intermediates remain addressable.
+        if step_ok and step["id"] == "00" and isinstance(step_result, str):
+            if (
+                step_result != video_path
+                and os.path.isfile(step_result)
+                and os.path.getsize(step_result) > 0
+            ):
+                print(f"  Pipeline source swapped to: {step_result}")
+                video_path = step_result
         if verify_outputs and step_ok:
             step_ok = verify_step_output(step, video_path)
         if not step_ok:
@@ -320,29 +392,6 @@ def main():
     if not active_steps:
         print("Error: no steps to run after applying filters")
         sys.exit(1)
-
-    # --dry-run (no video required; validates imports for the active step set)
-    if "--dry-run" in sys.argv:
-        print("Dry run: validating step modules and callables...\n")
-        failed = False
-        for step in active_steps:
-            try:
-                mod = import_module(step["module"])
-                fn = getattr(mod, step["func"])
-                if not callable(fn):
-                    print(f"  FAIL [{step['id']}] {step['module']}.{step['func']} is not callable")
-                    failed = True
-                else:
-                    print(f"  OK   [{step['id']}] {step['module']}.{step['func']}")
-            except Exception as e:
-                print(f"  FAIL [{step['id']}] {step['module']}: {e}")
-                failed = True
-        print()
-        if failed:
-            print("Dry run failed.")
-            sys.exit(1)
-        print("Dry run passed.")
-        return
 
     # --clean
     do_clean = "--clean" in sys.argv

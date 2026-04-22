@@ -78,6 +78,84 @@ def build_lossless_x264_args(video_path: str) -> list[str]:
     ]
 
 
+def build_fast_hq_x264_args(
+    video_path: str,
+    crf: int = 17,
+    preset: str = "veryfast",
+) -> list[str]:
+    """
+    Build FFmpeg args for a visually-lossless x264 encode that is dramatically
+    faster than lossless (crf 0 / veryslow). CRF 17 at veryfast is visually
+    indistinguishable from the source for intermediate pipeline steps while
+    running 20–50x faster on 4K footage.
+    """
+    stream_info = _probe_color_metadata(video_path)
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        *_build_color_args(stream_info),
+    ]
+
+
+def _videotoolbox_h264_available() -> bool:
+    """Detect whether ffmpeg was built with the VideoToolbox h264 encoder."""
+    try:
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return "h264_videotoolbox" in (probe.stdout or "")
+
+
+def build_videotoolbox_h264_args(
+    video_path: str,
+    quality: int = 75,
+) -> list[str]:
+    """
+    Build FFmpeg args for macOS hardware-accelerated H.264 via VideoToolbox.
+    Much faster than libx264 (offloads to the GPU/Media Engine). Quality is
+    a 1-100 scale; 75 is visually lossless for intermediate pipeline steps.
+    """
+    stream_info = _probe_color_metadata(video_path)
+    return [
+        "-c:v",
+        "h264_videotoolbox",
+        "-q:v",
+        str(quality),
+        "-b:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        *_build_color_args(stream_info),
+    ]
+
+
+def build_fast_pipeline_encode_args(video_path: str) -> list[str]:
+    """
+    Preferred fast-but-high-quality encoder for intermediate pipeline steps.
+    Uses VideoToolbox when available (macOS) and falls back to libx264
+    veryfast + crf 17 otherwise. Both are visually lossless in practice but
+    orders of magnitude faster than the true-lossless build used for archival.
+
+    Set env VIDEO_ENCODER=x264 to force software libx264 even on macOS.
+    """
+    if os.environ.get("VIDEO_ENCODER", "").lower() == "x264":
+        return build_fast_hq_x264_args(video_path)
+    if _videotoolbox_h264_available():
+        return build_videotoolbox_h264_args(video_path)
+    return build_fast_hq_x264_args(video_path)
+
+
 def build_moviepy_lossless_params(video_path: str) -> list[str]:
     """
     Build MoviePy ffmpeg_params to match FFmpeg lossless/color settings.
