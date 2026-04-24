@@ -34,6 +34,14 @@ export type CaptionsProps = {
   shadowBlurPx: number;
   yFromBottom: number;
   padding: number;
+  /**
+   * When true (default), the composition renders the source video as a
+   * full-bleed background via <OffthreadVideo>. When false, the background
+   * is transparent and only the caption text is painted — used by the
+   * overlay-only render path that composites against the untouched source
+   * via FFmpeg afterwards, skipping a costly video decode+re-encode.
+   */
+  renderMainVideo?: boolean;
   fps?: number;
   width?: number;
   height?: number;
@@ -181,6 +189,38 @@ const CaptionLine: React.FC<CaptionLineProps> = ({
   );
 };
 
+const MAX_WORDS_PER_LINE = 3;
+
+/**
+ * Split a caption into sub-captions of at most MAX_WORDS_PER_LINE words.
+ * Each chunk keeps the original word timings, but its `start`/`end` are
+ * tightened to the chunk's own word range so the Sequence only plays while
+ * those words are spoken — meaning at most 3 words are ever on screen.
+ */
+const chunkCaption = (caption: Caption): Caption[] => {
+  const { words } = caption;
+  if (words.length <= MAX_WORDS_PER_LINE) return [caption];
+  const chunks: Caption[] = [];
+  for (let i = 0; i < words.length; i += MAX_WORDS_PER_LINE) {
+    const slice = words.slice(i, i + MAX_WORDS_PER_LINE);
+    const nextSlice = words.slice(
+      i + MAX_WORDS_PER_LINE,
+      i + MAX_WORDS_PER_LINE + 1,
+    );
+    const start = slice[0].start;
+    // Extend the chunk up to the next chunk's first word so the last word's
+    // highlight-until-next-start rule keeps working inside the chunk.
+    const end = nextSlice.length ? nextSlice[0].start : caption.end;
+    chunks.push({
+      text: slice.map((w) => w.word).join("").trim(),
+      start,
+      end,
+      words: slice,
+    });
+  }
+  return chunks;
+};
+
 export const CaptionsComposition: React.FC<CaptionsProps> = ({
   mainVideoSrc,
   fontSrc,
@@ -192,14 +232,28 @@ export const CaptionsComposition: React.FC<CaptionsProps> = ({
   shadowBlurPx,
   yFromBottom,
   padding,
+  renderMainVideo = true,
 }) => {
   useCaptionFont(fontSrc);
   const { fps } = useVideoConfig();
 
+  // Overlay-only mode: transparent background + no video decode. The Python
+  // side composites the resulting alpha track over the untouched source via
+  // a single FFmpeg overlay pass, which is ~10x faster than re-encoding the
+  // whole video inside Chrome headless.
+  const backgroundColor = renderMainVideo ? "#000" : "transparent";
+
+  const chunkedCaptions = useMemo(
+    () => captions.flatMap(chunkCaption),
+    [captions],
+  );
+
   return (
-    <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      <OffthreadVideo src={staticFile(mainVideoSrc)} />
-      {captions.map((caption, i) => {
+    <AbsoluteFill style={{ backgroundColor }}>
+      {renderMainVideo && mainVideoSrc ? (
+        <OffthreadVideo src={staticFile(mainVideoSrc)} />
+      ) : null}
+      {chunkedCaptions.map((caption, i) => {
         const from = Math.max(0, Math.round(caption.start * fps));
         const duration = Math.max(
           1,

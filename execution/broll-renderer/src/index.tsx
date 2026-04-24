@@ -49,6 +49,7 @@ type CaptionsProps = {
   shadowBlurPx: number;
   yFromBottom: number;
   padding: number;
+  renderMainVideo: boolean;
 };
 
 const defaultCaptionsProps: CaptionsProps = {
@@ -66,6 +67,7 @@ const defaultCaptionsProps: CaptionsProps = {
   shadowBlurPx: 3.2,
   yFromBottom: 1020,
   padding: 250,
+  renderMainVideo: true,
 };
 
 const RemotionRoot = () => {

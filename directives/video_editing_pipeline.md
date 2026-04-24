@@ -10,6 +10,35 @@ Processar vídeos brutos de gravação, aplicando uma sequência de edições au
 - Vídeos finalizados em `output/`
 - Arquivos intermediários em `.tmp/` (podem ser apagados após conclusão)
 
+## Modo Always-On (pré-processamento automático)
+
+Antes da edição manual, é útil deixar um "ingestor" em `input/`: ele roda **só o passo 00** (conversão → `.tmp/{base}.mp4`). **A transcrição (01) corre depois do corte** no `00b_editor`, para os timestamps baterem com o vídeo já cortado.
+
+- **Script**: `execution/watch_input.py` (também acessível via `python execution/run_pipeline.py --watch`)
+- Polling sem dependências externas (scan em `input/` a cada N segundos, default 3s)
+- **Stable-file detection**: só processa quando `(size, mtime)` ficam idênticos em dois polls consecutivos — evita pegar arquivo no meio de um AirDrop/cópia do iPhone
+- Cache-aware: reaproveita `.tmp/{base}.mp4` do passo 00 quando já existir
+- Sequencial (um vídeo por vez) — sem competição por CPU/ `.tmp/` quando chegam múltiplos arquivos juntos
+- Ignora: dotfiles (`.DS_Store`), subpastas (`input/IMG_1792/` é tratada pelo passo 08c), extensões que não são vídeo
+
+Fluxo recomendado:
+```bash
+# terminal 1 — deixar ligado durante a sessão
+python execution/watch_input.py
+# (equivalente: python execution/run_pipeline.py --watch)
+
+# terminal 2 — após "✓ ready to trim": cortar no editor e marcar trim feito
+python execution/00b_editor.py            # trim primeiro; sidebar → "Mark trim done"
+
+# (transcrição: ao marcar trim no 00b corre em segundo plano por defeito;
+#  ou ``python execution/run_pipeline.py .tmp/IMG_1792.mp4 --only 01`` se EDITOR_AUTO_TRANSCRIBE=0)
+
+# terminal 3 — após transcrever: editar e **Save** no 00b (pipeline 02+ inicia sozinho por defeito), ou ``--skip 00,01`` manual se ``EDITOR_AUTO_PIPELINE=0``
+python execution/run_pipeline.py input/IMG_1792.MOV --skip 00,01   # só necessário com auto-pipeline desligado
+```
+
+Flags do watcher: `--interval <sec>`, `--input-dir <path>`, `--tmp-dir <path>`, `--once` (scan único, útil em CI), `--force` (ignora cache). `Ctrl+C` pede parada graciosa — termina o arquivo em andamento e sai.
+
 ## Pipeline de Edição (ordem de execução)
 
 ### Passo 0: Conversão da Fonte (MOV → MP4)
@@ -22,8 +51,28 @@ Processar vídeos brutos de gravação, aplicando uma sequência de edições au
 - Após rodar com sucesso, o `run_pipeline` troca o `video_path` ativo para o arquivo transcodificado, de forma que os passos seguintes operam no arquivo menor automaticamente
 - Overrides: `SOURCE_TRANSCODE_CRF` (default 20), `SOURCE_TRANSCODE_PRESET` (default `veryfast`)
 
+### Passo 0b: Editor Unificado (Interativo — opcional)
+- **Script**: `execution/00b_editor.py`
+- UI web local única (glassmorphism) que funde as duas ferramentas interativas antigas (`00b_trim_video.py` + `01b_fix_transcript.py`) em um só app.
+- Ao abrir, mostra uma **sidebar com a lista de arquivos editáveis em `.tmp/`** agrupados por basename: cada grupo lista o `.mp4` (modo “Video trim”) e o `*_transcript.json` (modo “Transcript”). Clicar em um item troca o painel da direita para o editor apropriado.
+- Modo **Video trim**: player HTML5 + timeline com marcadores de corte, atalhos `Space` play/pause · `←/→` ±0.1s · `Shift+←/→` ±1s · `I`/`O` cut-in/cut-out · `[`/`]` trim start/end. Ao salvar, o FFmpeg renderiza os segmentos mantidos (`filter_complex trim+atrim+concat`) e sobrescreve `.tmp/{base}.mp4` atomicamente, criando `.tmp/{base}.mp4.bak` no primeiro save.
+- Modo **Transcript**: find/replace ciente de pontuação sobre `words`/`segments[*].words`/`text`, com lista de palavras únicas na lateral e histórico das substituições. Save cria `.bak` do JSON no primeiro save.
+- **Passo manual**: não entra sozinho no `run_pipeline`. Ordem: **trim** → **Mark trim done** → **passo 01** sobre `.tmp/{base}.mp4` → **transcript** → **Mark transcript review done** → passos 02+.
+  ```bash
+  python execution/00b_editor.py                              # abre sidebar com .tmp/
+  python execution/00b_editor.py .tmp/IMG_1792.mp4            # pré-abre em Video trim
+  python execution/00b_editor.py .tmp/IMG_1792_transcript.json  # pré-abre em Transcript
+  python execution/00b_editor.py --port 5060                  # trocar porta (default 5058)
+  python execution/00b_editor.py --mark-trim-done .tmp/IMG_1792.mp4
+  python execution/00b_editor.py --mark-done .tmp/IMG_1792.mp4   # após existir transcript
+  ```
+- **Gates** (ficheiro `.tmp/{base}_editor_review.json`): **trim confirmado** antes do passo 01; **revisão da transcrição** antes dos passos 02+. Após **Mark trim done**, o passo 01 corre **automaticamente** no `00b_editor` (`EDITOR_AUTO_TRANSCRIBE`, defeito ligado). Após **Save** na transcrição, os passos 02+ arrancam sozinhos após um debounce (`EDITOR_AUTO_PIPELINE`, defeito ligado; `EDITOR_AUTO_PIPELINE_DEBOUNCE` em segundos, defeito 3). **Mark transcript review done** confirma revisão e inicia o pipeline já. `EDITOR_AUTO_PIPELINE=0` — só `run_pipeline.py --skip 00,01` manual. Novo trim apaga o marker. Bypass: `--skip-editor-gate` / `PIPELINE_SKIP_EDITOR_GATE=1`.
+- Como os arquivos mantêm o mesmo basename `{base}`, todos os intermediários `.tmp/{base}_*` ficam consistentes e os passos seguintes (02 em diante) podem rodar normalmente.
+- Edge case (trim): se marcar cortes que cobririam o vídeo inteiro, o save é recusado com erro claro; se o vídeo não tiver áudio, `atrim`/mapeamento de áudio são omitidos automaticamente.
+
 ### Passo 1: Transcrição e Análise
 - **Script**: `execution/01_transcribe.py`
+- **Colocação**: depois do **corte** no `00b_editor` e de **Mark trim done** (o Whisper deve correr sobre `.tmp/{base}.mp4` já com a duração final).
 - Transcreve o áudio usando Whisper
 - Gera arquivo de transcrição com timestamps em `.tmp/{video}_transcript.json`
 - Identifica filler words e retakes no texto
@@ -91,12 +140,16 @@ Processar vídeos brutos de gravação, aplicando uma sequência de edições au
 
 ### Passo 8b: Hard Cut Zoom (Dinâmico)
 - **Script**: `execution/08b_hard_cut_zoom.py`
-- A cada ~3 segundos, alterna instantaneamente entre plano aberto (1.0x) e close-up (1.4x) centralizado no rosto
+- Alterna instantaneamente entre plano aberto (1.0x) e close-up (1.4x) centralizado no rosto
 - Sem transição/easing — corte seco (hard cut) para criar ritmo dinâmico estilo TikTok/YouTube
-- Usa MediaPipe para detecção facial
+- **Modo AI (padrão quando OpenRouter está configurado)**: lê `.tmp/{video}_transcript.json` e envia os segmentos para o OpenRouter (`OPENROUTER_API_KEY` + `OPENROUTER_MODEL(S)`) pedindo para identificar os momentos mais impactantes do discurso (punchlines, fatos-chave, beats emocionais, CTAs). Esses momentos viram as janelas de close-up; o restante fica em plano aberto.
+- **Modo fallback (sem API / sem momentos / sem transcript)**: alterna a cada `CUT_INTERVAL` segundos (default 5.0s), plano aberto → close-up → plano aberto...
+- Usa OpenCV Haar cascade para detecção facial (MediaPipe tem problemas de protobuf)
 - Se não detectar face, usa centro do frame
-- Processamento via OpenCV frame a frame + mux de áudio com FFmpeg
+- Processamento via filter_complex do FFmpeg (trim + crop + scale + concat)
 - Gera `.tmp/{video}_hardcut.mp4`
+- **Sidecar para o passo 8d**: os momentos escolhidos pela IA (ou lista vazia) também são gravados em `.tmp/{video}_zoom_moments.json` (`{ "moments": [{start, end, reason}, ...] }`) para que o passo 8d toque FX nesses beats sem precisar chamar o LLM de novo
+- Tunables: `CUT_INTERVAL`, `ZOOM_LEVEL`, `AI_ZOOM_MIN_DURATION`, `AI_ZOOM_MAX_DURATION`, `AI_ZOOM_MAX_MOMENTS`, `AI_ZOOM_MIN_GAP`
 
 ### Passo 8c: B-Roll Overlay
 - **Script**: `execution/08c_broll.py`
@@ -110,6 +163,51 @@ Processar vídeos brutos de gravação, aplicando uma sequência de edições au
 - Renderização: tenta Remotion (ProRes 4444 com alpha) primeiro, cai para FFmpeg se falhar
 - Projeto Remotion em `execution/broll-renderer/` (requer `npm install`)
 - Gera `.tmp/{video}_broll.mp4`
+
+### Passo 8d: FX Sounds (SFX nos momentos impactantes)
+- **Script**: `execution/08d_fx_sounds.py`
+- Lê `.tmp/{video}_zoom_moments.json` (gerado pelo 8b) e, para cada momento impactante escolhido pela IA (punchline, fato-chave, beat emocional, CTA), toca um FX aleatório de `fxs/` começando exatamente no `start` do momento
+- Escolha dos FX é embaralhada com proteção anti-repetição: o mesmo efeito nunca toca duas vezes seguidas, mesmo quando há mais momentos que arquivos em `fxs/`
+- Input preferencial: `.tmp/{video}_broll.mp4` → `_hardcut.mp4` → intermediários anteriores. O vídeo é copiado em stream (sem re-encode), só a faixa de áudio é remuxada em ALAC com `amix`
+- Quando não há momentos da IA (sem transcript, sem OpenRouter, ou array vazio), ou quando `fxs/` está vazio, ou quando `FX_DISABLE=1`, o passo faz passthrough (stream-copy) para manter `.tmp/{video}_fx.mp4` como saída canônica que o 9 e o 10 consomem
+- Tunables via env: `FX_VOLUME` (default 0.6), `FX_MAX_DURATION` (default 2.5s — trunca FX longos pra não cobrir a voz), `FX_DIR` (default `fxs`), `FX_DISABLE=1` pula
+- Gera `.tmp/{video}_fx.mp4`
+
+### Passo 8e: Data Viz Overlay (Porcentagens e dados)
+- **Script**: `execution/08e_data_viz.py`
+- Detecta dados numéricos citados na transcrição e substitui o vídeo por uma visualização fullscreen animada (progress ring + contador + label) por ~2s, com o áudio continuando por baixo (cutaway). Escopo inicial: porcentagens em PT-BR; arquitetura extensível (lista `DETECTORS`) pra adicionar dinheiro/datas/comparações depois.
+- **Detecção determinística** (sem LLM): scan sobre `words[]` do transcript procurando 4 padrões:
+  - `"100%"` (token único com `%`)
+  - `"50" "%"` (dois tokens consecutivos)
+  - `"50" "por" "cento"` / `"vinte" "por" "cento"` (três tokens, inclui números por extenso PT-BR: `zero..dezenove`, `vinte, trinta, ..., noventa`, `cem`, `cento`, `meio/metade`→50)
+  - `"50" "porcento"` / `"vinte" "porcento"` (forma glued, dois tokens)
+- Filtros: valor clampado em 0-100, gap mínimo entre moments (`MIN_GAP_BETWEEN_MOMENTS=1.5s`)
+- **OpenRouter enrichment (opcional)**: quando `OPENROUTER_API_KEY` + `OPENROUTER_MODEL(S)` estão setados, manda até 12 moments com contexto (segmento da frase + antes/depois) pedindo JSON com `{label, duration, emphasis}`:
+  - `label`: caption PT-BR curta (3-6 palavras, vai ficar abaixo do ring)
+  - `duration`: float entre 1.5s e 3.0s
+  - `emphasis`: `growth` (verde #07CA6B), `drop` (vermelho #EA2143) ou `neutral` (azul #1856FF) — define a paleta do card
+- **Render**: usa HeyGen **HyperFrames** (HTML/CSS/GSAP, não Remotion). Projeto em `execution/dataviz-renderer/` com `package.json`, `hyperframes.json` e `templates/percentage-ring.html.tpl`. Para cada moment, o Python materializa um projeto one-off em `.tmp/dataviz_NN/` substituindo tokens (`__WIDTH__`, `__HEIGHT__`, `__VALUE__`, `__LABEL__`, `__DURATION__`, `__COLOR_*__`) e roda `npx hyperframes render --quality standard --fps {fps_do_video}`. Renderização em paralelo via `ThreadPoolExecutor` (default 2 workers, cada um instancia um Chrome headless ~500MB)
+- **Template**: SVG progress ring (stroke-dashoffset tween 0→value%), contador central animado (GSAP onUpdate tweenando um escalar e escrevendo o valor arredondado no DOM), label com letterspacing, backdrop com radial glow tintado pelo `emphasis`. Fonte Plus Jakarta Sans, tipografia/cores vindas do design system do projeto (CLAUDE.md). Sizing responsivo via `min(vw, vh)` — funciona tanto em 1080x1920 quanto 2160x3840 sem mudar o template
+- **Composite**: FFmpeg overlay com `enable='between(t,start,end)':format=auto`, áudio copiado em stream (`-c:a copy`). O overlay cobre o frame inteiro nos moments ativos — cutaway limpo
+- **Placement no pipeline**: depois do 08d (fx_sounds), antes do 09 (captions). Os passos 09 e 10 foram atualizados pra procurar `_dataviz.mp4` como primeira opção na resolução de input
+- **Saídas**:
+  - `.tmp/{base}_dataviz.mp4` (vídeo com overlays)
+  - `.tmp/{base}_dataviz_moments.json` (sidecar: lista de moments com `value/start/end/label/duration/emphasis/model`)
+- **Fallbacks graciosos**:
+  - sem transcript → skip silencioso
+  - sem `%` detectado → passthrough (copia o input como `_dataviz.mp4` para manter o nome canônico na cadeia)
+  - sem `OPENROUTER_API_KEY` → usa defaults (label = snippet da fala, emphasis=neutral, duration=2.0s)
+  - `npx hyperframes` não encontrado → loga e passa adiante
+  - clip individual falha → é descartado, o resto é compositado normalmente
+- **Tunables via env**:
+  - `DATAVIZ_DISABLE=1` pula o passo inteiro
+  - `DATAVIZ_RENDER_WORKERS=<n>` (default 2) — quantos Chrome headless simultâneos
+  - `OPENROUTER_MODEL(S)` — reutiliza os mesmos do 08b/08c
+- **Dependências extras e setup (uma vez só)**:
+  - Node.js ≥ 22 (pro `hyperframes` 0.4+)
+  - Skills instaladas com `npx skills add heygen-com/hyperframes` e `npx skills add remotion-dev/skills` (só a skill `hyperframes` é usada em runtime; a do Remotion serve pro `broll-renderer` do 08c)
+  - **Install local do hyperframes** (obrigatório — não usar `npx --yes hyperframes`): `cd execution/dataviz-renderer && PUPPETEER_SKIP_DOWNLOAD=1 npm install`. Motivo: `npx` resolve o Node module search pra cima e pode pegar um `puppeteer` desatualizado no home do usuário (`/Users/.../node_modules/puppeteer`), cujo `createCDPSession` não existe. O install local "sombra" essa resolução com puppeteer 24.x moderno
+  - **Chrome Headless Shell 131** instalado em `~/.cache/puppeteer/chrome-headless-shell/`: `npx --yes @puppeteer/browsers@latest install chrome-headless-shell@131.0.6778.85 --path ~/.cache/puppeteer`. Motivo: Hyperframes 0.4.12 fixou Chrome 131; Chrome do sistema mais novo (140+) quebra o CDP. O `.npmrc` em `dataviz-renderer/` já tem `puppeteer_skip_download=true` porque usamos o Chrome Headless Shell instalado acima, não o que vem com puppeteer
 
 ### Passo 9: Legendas com captacity
 - **Script**: `execution/09_captions.py`

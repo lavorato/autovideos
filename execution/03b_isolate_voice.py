@@ -120,9 +120,14 @@ def isolate_voice(video_path: str, tmp_dir: str = ".tmp") -> str:
     os.makedirs(tmp_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(video_path))[0]
 
-    input_video = os.path.join(tmp_dir, f"{base}_no_fillers.mp4")
-    if not os.path.exists(input_video):
-        input_video = video_path
+    input_video = video_path
+    for candidate in (
+        os.path.join(tmp_dir, f"{base}_no_retakes.mp4"),
+        os.path.join(tmp_dir, f"{base}_no_fillers.mp4"),
+    ):
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            input_video = candidate
+            break
 
     output_path = os.path.join(tmp_dir, f"{base}_voice.mp4")
 

@@ -3,7 +3,7 @@ Developer harness for exercising pipeline steps in isolation.
 
   python execution/test_pipeline_steps.py list
   python execution/test_pipeline_steps.py smoke
-  python execution/test_pipeline_steps.py run 08b input/my_video.mp4 [--verify] [--clean]
+  python execution/test_pipeline_steps.py run 08b input/my_video.mp4 [--verify] [--clean] [--skip-editor-gate]
 
 The main runner also supports:
   python execution/run_pipeline.py input/video.mp4 --step 08b --verify
@@ -60,7 +60,13 @@ def cmd_smoke() -> int:
     return 0
 
 
-def cmd_run(step_query: str, video: str, verify: bool, clean: bool) -> int:
+def cmd_run(
+    step_query: str,
+    video: str,
+    verify: bool,
+    clean: bool,
+    skip_editor_gate: bool,
+) -> int:
     steps_meta = rp.get_steps()
     step = rp.match_step(step_query, steps_meta)
     if not step:
@@ -73,7 +79,14 @@ def cmd_run(step_query: str, video: str, verify: bool, clean: bool) -> int:
     active = [step]
     if clean:
         rp.clean_tmp(video)
-    ok = rp.process_video(video, active, do_clean=False, verify_outputs=verify, fail_fast=True)
+    ok = rp.process_video(
+        video,
+        active,
+        do_clean=False,
+        verify_outputs=verify,
+        fail_fast=True,
+        skip_editor_gate=skip_editor_gate,
+    )
     return 0 if ok else 1
 
 
@@ -92,6 +105,11 @@ def main() -> int:
     p_run.add_argument("video", help="Path to input video")
     p_run.add_argument("--verify", action="store_true", help="Check expected outputs after the step")
     p_run.add_argument("--clean", action="store_true", help="Remove .tmp intermediates for this basename first")
+    p_run.add_argument(
+        "--skip-editor-gate",
+        action="store_true",
+        help="Run without .tmp/{base}_editor_review.json (same as run_pipeline.py).",
+    )
 
     args = parser.parse_args()
     if args.command == "list":
@@ -99,7 +117,13 @@ def main() -> int:
     if args.command == "smoke":
         return cmd_smoke()
     if args.command == "run":
-        return cmd_run(args.step, args.video, args.verify, args.clean)
+        return cmd_run(
+            args.step,
+            args.video,
+            args.verify,
+            args.clean,
+            args.skip_editor_gate,
+        )
     return 1
 
 

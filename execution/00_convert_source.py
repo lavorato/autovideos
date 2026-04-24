@@ -18,21 +18,28 @@ Encoder choice — why libx264 veryfast CRF 20 instead of VideoToolbox:
     visually transparent and typically ~20–30% smaller than the iPhone MOV.
 
 Behavior:
-    - Only runs on .mov/.mkv/.avi sources. Already-compact formats (.mp4/.webm)
-      pass through untouched.
+    - Always runs on .mov/.mkv/.avi sources (heavy codecs).
+    - For other formats (.mp4/.webm/...), the source is probed and transcoded
+      only if its long edge exceeds 1920 px; otherwise it passes through
+      untouched.
     - Output: .tmp/{base}.mp4  (same base as the source → downstream tmp paths
       like .tmp/{base}_transcript.json remain unchanged)
     - Reuses an existing non-empty output (fast re-runs).
+    - Resolution: the long edge is capped at 1920 while preserving aspect
+      ratio (landscape -> up to 1920x1080, portrait -> up to 1080x1920).
+      Smaller sources are never upscaled.
     - Audio: re-encoded to AAC 256k (transparent for speech) to guarantee
       MP4 container compatibility regardless of source codec.
 
 Environment overrides:
     SOURCE_TRANSCODE_CRF  libx264 CRF value (default: 20).
     SOURCE_TRANSCODE_PRESET libx264 preset (default: veryfast).
+    SOURCE_MAX_LONG_EDGE  Long-edge cap in pixels (default: 1920).
 
 Returns the path that downstream steps should use (converted mp4 when
 transcoding happened, original path otherwise).
 """
+import json
 import os
 import sys
 import subprocess
@@ -50,14 +57,55 @@ def _size_mb(path: str) -> float:
         return 0.0
 
 
+def _probe_dimensions(video_path: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream, or (0, 0) on failure."""
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return (0, 0)
+    data = json.loads(probe.stdout or "{}")
+    streams = data.get("streams") or []
+    if not streams:
+        return (0, 0)
+    return (int(streams[0].get("width") or 0), int(streams[0].get("height") or 0))
+
+
 def convert_source(video_path: str, tmp_dir: str = ".tmp") -> str:
     ext = os.path.splitext(video_path)[1].lower()
     base = os.path.splitext(os.path.basename(video_path))[0]
     os.makedirs(tmp_dir, exist_ok=True)
     output_path = os.path.join(tmp_dir, f"{base}.mp4")
 
-    if ext not in HEAVY_EXTENSIONS:
-        print(f"[00] Source is {ext or 'unknown'}; no transcode needed, using original.")
+    max_long_edge = int(os.getenv("SOURCE_MAX_LONG_EDGE", "1920"))
+    width, height = _probe_dimensions(video_path)
+    long_edge = max(width, height)
+    oversized = long_edge > max_long_edge
+
+    is_heavy = ext in HEAVY_EXTENSIONS
+    if not is_heavy and not oversized:
+        if long_edge:
+            print(
+                f"[00] Source is {ext or 'unknown'} at {width}x{height} "
+                f"(long edge {long_edge} <= {max_long_edge}); using original."
+            )
+        else:
+            print(f"[00] Source is {ext or 'unknown'}; no transcode needed, using original.")
+        return video_path
+
+    # Avoid clobbering the source if the input itself lives at the output path.
+    if os.path.abspath(video_path) == os.path.abspath(output_path):
+        print(f"[00] Source already at output path; using original: {video_path}")
         return video_path
 
     if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
@@ -72,15 +120,27 @@ def convert_source(video_path: str, tmp_dir: str = ".tmp") -> str:
     in_mb = _size_mb(video_path)
     crf = int(os.getenv("SOURCE_TRANSCODE_CRF", "20"))
     preset = os.getenv("SOURCE_TRANSCODE_PRESET", "veryfast")
+    reason = "heavy format" if is_heavy else f"oversized ({long_edge}px > {max_long_edge}px)"
     print(
-        f"[00] Transcoding source for faster pipeline processing: {video_path} "
-        f"({in_mb:.1f} MB) -> libx264 preset={preset} crf={crf}"
+        f"[00] Transcoding source ({reason}) for faster pipeline processing: {video_path} "
+        f"({in_mb:.1f} MB, {width}x{height}) -> libx264 preset={preset} crf={crf}"
     )
 
     video_args = build_fast_hq_x264_args(video_path, crf=crf, preset=preset)
+    # Cap the long edge at max_long_edge so landscape sources become at most
+    # {cap}x{cap*9/16} and portrait sources at most {cap*9/16}x{cap}. Aspect
+    # ratio is preserved and smaller videos are never upscaled (min(...) keeps
+    # the original dimension when already smaller). -2 lets ffmpeg auto-compute
+    # the other dimension while keeping it divisible by 2 (required by yuv420p).
+    scale_filter = (
+        "scale="
+        f"'if(gt(iw,ih),min({max_long_edge},iw),-2)':"
+        f"'if(gt(iw,ih),-2,min({max_long_edge},ih))'"
+    )
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
         "-i", video_path,
+        "-vf", scale_filter,
         *video_args,
         "-c:a", "aac", "-b:a", "256k",
         "-movflags", "+faststart",

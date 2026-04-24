@@ -15,6 +15,9 @@ Usage:
   python execution/run_pipeline.py input/video.mp4 --verify --fail-fast
                                                               # stop at first failure and exit non-zero
   python execution/run_pipeline.py --dry-run                   # import step modules only (no video)
+  python execution/run_pipeline.py --watch                     # always-on: auto-run 00 (convert) on new input/ files
+  python execution/run_pipeline.py --watch --interval 5        # watcher with custom poll interval
+  python execution/run_pipeline.py --skip-editor-gate ...     # skip trim + transcript review gates
   python execution/test_pipeline_steps.py list|smoke|run ...   # developer harness for single steps
 """
 import sys
@@ -22,6 +25,7 @@ import os
 import json
 import time
 import traceback
+from contextlib import contextmanager
 
 # Add execution dir to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -38,23 +42,31 @@ except ImportError:
 
 from importlib import import_module
 
+import editor_gate
+
 # All steps in pipeline order. "enabled" is the default state.
 ALL_STEPS = [
     {"id": "00", "module": "00_convert_source",   "func": "convert_source",      "label": "Convert Source",     "enabled": True},
     {"id": "01", "module": "01_transcribe",       "func": "transcribe",          "label": "Transcription",      "enabled": True},
-    {"id": "02", "module": "02_remove_retakes",   "func": "remove_retakes",      "label": "Remove Retakes",     "enabled": True},
     {"id": "03", "module": "03_remove_fillers",   "func": "remove_fillers",      "label": "Remove Fillers",     "enabled": True},
+    {"id": "02", "module": "02_remove_retakes",   "func": "remove_retakes",      "label": "Remove Retakes",     "enabled": True},
     {"id": "03b","module": "03b_isolate_voice",   "func": "isolate_voice",       "label": "Isolate Voice",      "enabled": True},
     {"id": "04", "module": "04_studio_sound",     "func": "apply_studio_sound",  "label": "Studio Sound",       "enabled": True},
     {"id": "05", "module": "05_fix_mute",         "func": "fix_mute",            "label": "Fix Mute Gaps",      "enabled": True},
     {"id": "06", "module": "06_split_scenes",     "func": "split_scenes",        "label": "Scene Detection",    "enabled": True},
     {"id": "07", "module": "07_color_correction", "func": "color_correct",       "label": "Color Correction",   "enabled": False},
     {"id": "08", "module": "08_zoom_pan",         "func": "apply_zoom_pan",      "label": "Zoom & PAN Effects", "enabled": False},
+    {"id": "08a","module": "08a_multicam",        "func": "apply_multicam",      "label": "Multi-Cam Intercut", "enabled": True},
     {"id": "08b","module": "08b_hard_cut_zoom",   "func": "apply_hard_cut_zoom", "label": "Hard Cut Zoom",      "enabled": True},
     {"id": "08c","module": "08c_broll",           "func": "apply_broll",         "label": "B-Roll Overlay",     "enabled": True},
+    {"id": "08d","module": "08d_fx_sounds",       "func": "add_fx_sounds",       "label": "FX Sounds",          "enabled": True},
+    {"id": "08e","module": "08e_data_viz",        "func": "apply_data_viz",      "label": "Data Viz Overlay",   "enabled": True},
     {"id": "09", "module": "09_captions",         "func": "add_captions",        "label": "Captions",           "enabled": True},
     {"id": "10", "module": "10_background_music", "func": "add_background_music","label": "Background Music",   "enabled": True},
 ]
+
+REVIEW_GATED_STEP_IDS = editor_gate.editor_gate_step_ids(ALL_STEPS)
+TRANSCRIBE_GATED_STEP_IDS = editor_gate.TRANSCRIBE_GATE_STEP_IDS
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "pipeline_config.json")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
@@ -71,6 +83,8 @@ STEP_OUTPUT_PATTERNS = {
     "08": [".tmp/{base}_effects.mp4"],
     "08b": [".tmp/{base}_hardcut.mp4"],
     "08c": [".tmp/{base}_broll.mp4"],
+    "08d": [".tmp/{base}_fx.mp4"],
+    "08e": [".tmp/{base}_dataviz.mp4"],
     "09": ["output/{base}_final.mp4"],
     "10": ["output/{base}_final.mp4"],
 }
@@ -104,6 +118,30 @@ def build_log_file_path() -> str:
     os.makedirs(LOGS_DIR, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     return os.path.abspath(os.path.join(LOGS_DIR, f"run-{timestamp}.log"))
+
+
+@contextmanager
+def pipeline_run_log():
+    """Tee stdout/stderr to ``logs/pipeline/run-*.log`` for the block body.
+
+    Use this when invoking ``process_video`` from another module (e.g. ``00b_editor``)
+    so file logging matches ``python execution/run_pipeline.py``."""
+    log_path = build_log_file_path()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    log_file = open(log_path, "w", encoding="utf-8")
+    try:
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
+        print(f"Logging this run to: {log_path}")
+        try:
+            yield log_path
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+    finally:
+        log_file.close()
+        print(f"Run log saved to: {log_path}", file=original_stdout, flush=True)
 
 
 # ── Config persistence ────────────────────────────────────────
@@ -252,7 +290,15 @@ def verify_step_output(step: dict, video_path: str) -> bool:
     return True
 
 
-def process_video(video_path: str, steps: list, do_clean: bool = False, verify_outputs: bool = False, fail_fast: bool = False) -> bool:
+def process_video(
+    video_path: str,
+    steps: list,
+    do_clean: bool = False,
+    verify_outputs: bool = False,
+    fail_fast: bool = False,
+    skip_editor_gate: bool = False,
+    tmp_dir: str = ".tmp",
+) -> bool:
     print(f"\n{'='*60}")
     print(f"  Processing: {video_path}")
     print(f"  Steps: {len(steps)} active")
@@ -264,19 +310,49 @@ def process_video(video_path: str, steps: list, do_clean: bool = False, verify_o
     start_total = time.time()
     all_ok = True
     for step in steps:
+        if (
+            not skip_editor_gate
+            and step["id"] in TRANSCRIBE_GATED_STEP_IDS
+            and not editor_gate.is_trim_complete(video_path, tmp_dir)
+        ):
+            marker = os.path.abspath(editor_gate.editor_review_path(video_path, tmp_dir))
+            print(
+                f"\n  BLOCKED: Trim must be finished in 00b before transcribe (step 01).\n"
+                f"  Open `python execution/00b_editor.py`, save your trim, then “Mark trim done (ready to transcribe)”.\n"
+                f"  Marker file: {marker}\n"
+                f"  Or bypass (automation only): --skip-editor-gate or PIPELINE_SKIP_EDITOR_GATE=1\n"
+            )
+            return False
+        if (
+            not skip_editor_gate
+            and step["id"] in REVIEW_GATED_STEP_IDS
+            and not editor_gate.is_editor_review_complete(video_path, tmp_dir)
+        ):
+            marker = os.path.abspath(editor_gate.editor_review_path(video_path, tmp_dir))
+            print(
+                f"\n  BLOCKED: Transcript review is not confirmed for this video (post-step-01).\n"
+                f"  Expected marker: {marker}\n"
+                f"  Open `python execution/00b_editor.py`, fix the transcript if needed, then “Mark transcript review done”.\n"
+                f"  Or bypass (automation only): --skip-editor-gate or PIPELINE_SKIP_EDITOR_GATE=1\n"
+            )
+            return False
         step_ok, step_result = run_step(step, video_path)
         # Step 00 transcodes the source to a smaller .mp4; swap the active
         # video_path so every downstream step operates on the lighter file.
         # The output keeps the original basename (e.g. .tmp/IMG_1792.mp4),
         # so .tmp/{base}_*.* intermediates remain addressable.
-        if step_ok and step["id"] == "00" and isinstance(step_result, str):
-            if (
-                step_result != video_path
-                and os.path.isfile(step_result)
-                and os.path.getsize(step_result) > 0
-            ):
-                print(f"  Pipeline source swapped to: {step_result}")
-                video_path = step_result
+        # Any step that returns a non-empty .mp4 becomes the active source for
+        # the rest of the run (transcribe returns .json — ignored).
+        if (
+            step_ok
+            and isinstance(step_result, str)
+            and step_result.lower().endswith(".mp4")
+            and os.path.isfile(step_result)
+            and os.path.getsize(step_result) > 0
+            and step_result != video_path
+        ):
+            print(f"  Pipeline source swapped to: {step_result}")
+            video_path = step_result
         if verify_outputs and step_ok:
             step_ok = verify_step_output(step, video_path)
         if not step_ok:
@@ -312,7 +388,10 @@ Commands:
   --clean                  Clear .tmp/ files for the video before running
   --verify                 Verify expected output file after each step
   --fail-fast              Stop run on first failed step (or failed verify)
+  --skip-editor-gate       Skip trim gate (before 01) and review gate (before 02+)
   --dry-run                Import each selected step's module/callable only (exits 0 if OK)
+  --watch                  Always-on: monitor input/ and auto-run 00 (convert) on new files
+                           (accepts --interval, --once, --force, --input-dir, --tmp-dir)
 
 Step IDs accept: number (08b), module name (08b_hard_cut_zoom), or label (captions)
 """)
@@ -336,6 +415,15 @@ def main():
     if "--list" in sys.argv:
         print_steps_table(all_steps)
         return
+
+    # --watch: delegate to the always-on folder watcher and exit.
+    if "--watch" in sys.argv:
+        from importlib import import_module
+        watch_mod = import_module("watch_input")
+        # Forward supported flags through unchanged; watch_input.py does its
+        # own argparse, so we pass everything except --watch itself.
+        forwarded = [a for a in sys.argv[1:] if a != "--watch"]
+        sys.exit(watch_mod.main(forwarded))
 
     # --enable / --disable (persistent, then exit)
     enable_val = get_flag_value("--enable")
@@ -397,6 +485,9 @@ def main():
     do_clean = "--clean" in sys.argv
     verify_outputs = "--verify" in sys.argv
     fail_fast = "--fail-fast" in sys.argv
+    skip_editor_gate = "--skip-editor-gate" in sys.argv or os.environ.get(
+        "PIPELINE_SKIP_EDITOR_GATE", ""
+    ).strip().lower() in ("1", "true", "yes")
 
     # Resolve videos (positional args that aren't flag values)
     flag_values = set()
@@ -414,7 +505,14 @@ def main():
         if not os.path.exists(video_path):
             print(f"Error: {video_path} not found")
             sys.exit(1)
-        ok = process_video(video_path, active_steps, do_clean, verify_outputs, fail_fast)
+        ok = process_video(
+            video_path,
+            active_steps,
+            do_clean,
+            verify_outputs,
+            fail_fast,
+            skip_editor_gate=skip_editor_gate,
+        )
         if not ok:
             sys.exit(1)
     else:
@@ -429,7 +527,14 @@ def main():
 
         failed_videos = []
         for video in videos:
-            ok = process_video(video, active_steps, do_clean, verify_outputs, fail_fast)
+            ok = process_video(
+                video,
+                active_steps,
+                do_clean,
+                verify_outputs,
+                fail_fast,
+                skip_editor_gate=skip_editor_gate,
+            )
             if not ok:
                 failed_videos.append(video)
                 if fail_fast:
@@ -446,20 +551,8 @@ def main():
 
 def run_with_file_logging():
     """Run pipeline while duplicating all stdout/stderr into a log file."""
-    log_path = build_log_file_path()
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-
-    try:
-        with open(log_path, "w", encoding="utf-8") as log_file:
-            sys.stdout = TeeStream(original_stdout, log_file)
-            sys.stderr = TeeStream(original_stderr, log_file)
-            print(f"Logging this run to: {log_path}")
-            main()
-    finally:
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        print(f"Run log saved to: {log_path}")
+    with pipeline_run_log():
+        main()
 
 
 if __name__ == "__main__":

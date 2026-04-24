@@ -189,8 +189,8 @@ def transcribe(video_path: str, output_dir: str = ".tmp") -> str:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
-    model_size = os.getenv("WHISPERX_MODEL", "medium")
-    batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
+    model_size = os.getenv("WHISPERX_MODEL", "large-v3")
+    batch_size = int(os.getenv("WHISPERX_BATCH_SIZE", "32"))
 
     print(f"[01] Loading WhisperX model ({model_size}) on {device} ({compute_type})...")
     model = whisperx.load_model(model_size, device=device, compute_type=compute_type)

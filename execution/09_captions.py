@@ -23,9 +23,9 @@ from captacity import segment_parser
 from moviepy import CompositeVideoClip
 
 from video_encoding import (
+    build_fast_pipeline_encode_args,
     build_moviepy_lossless_params,
     first_existing_nonempty_video,
-    _probe_color_metadata,
 )
 
 
@@ -198,116 +198,79 @@ def _build_captions_from_transcript(
     return cleaned
 
 
-def _setup_remotion_public_dir(tmp_dir: str, base: str,
-                                source_video: str, font_path: str) -> tuple[str, str, str]:
+def _setup_remotion_public_dir(tmp_dir: str, base: str, font_path: str) -> tuple[str, str]:
     """
-    Build a per-run public dir for Remotion's staticFile resolution. We copy
-    (hardlink when on the same filesystem) both the source video and the bold
-    font into it so Chrome headless can load them via `staticFile(basename)`.
+    Build a per-run public dir for Remotion's staticFile resolution. The
+    overlay-only render path only needs the font file — the source video is
+    never decoded inside Chrome; it's composited in via FFmpeg afterwards.
 
     We intentionally avoid symlinks: Remotion bundles the `--public-dir` into
     its webpack output without dereferencing, so symlinked entries show up as
     dangling links inside the bundle and fail with HTTP 404 at render time.
-    Returns (public_dir, video_basename, font_basename).
+    Hardlink when possible (instant, no extra disk), fall back to copy on
+    cross-device mounts.
+
+    Returns (public_dir, font_basename).
     """
     public_dir = os.path.abspath(os.path.join(tmp_dir, "captions_public", base))
     if os.path.isdir(public_dir):
         shutil.rmtree(public_dir, ignore_errors=True)
     os.makedirs(public_dir, exist_ok=True)
 
-    def _materialize(src: str, dest: str) -> None:
-        src_abs = os.path.abspath(src)
-        if os.path.exists(dest) or os.path.islink(dest):
-            os.remove(dest)
-        # Hardlink is instant and disk-free when src and public_dir are on the
-        # same filesystem; fall back to full copy if not (cross-device or FS
-        # that doesn't support hardlinks).
-        try:
-            os.link(src_abs, dest)
-        except OSError:
-            shutil.copy2(src_abs, dest)
-
-    video_basename = os.path.basename(source_video)
     font_basename = os.path.basename(font_path)
+    dest = os.path.join(public_dir, font_basename)
+    src_abs = os.path.abspath(font_path)
+    try:
+        os.link(src_abs, dest)
+    except OSError:
+        shutil.copy2(src_abs, dest)
 
-    _materialize(source_video, os.path.join(public_dir, video_basename))
-    _materialize(font_path, os.path.join(public_dir, font_basename))
-
-    return public_dir, video_basename, font_basename
-
-
-# H.273 numeric codes for common ffprobe color metadata strings. The
-# h264_metadata bitstream filter wants integers here, not names.
-_COLOUR_PRIMARIES_CODES = {
-    "bt709": 1, "unspecified": 2, "bt470m": 4, "bt470bg": 5, "smpte170m": 6,
-    "smpte240m": 7, "film": 8, "bt2020": 9, "smpte428": 10,
-    "smpte431": 11, "smpte432": 12, "jedec-p22": 22,
-}
-_TRANSFER_CODES = {
-    "bt709": 1, "unspecified": 2, "gamma22": 4, "gamma28": 5, "smpte170m": 6,
-    "smpte240m": 7, "linear": 8, "log": 9, "log-sqrt": 10,
-    "iec61966-2-4": 11, "bt1361e": 12, "iec61966-2-1": 13,
-    "bt2020-10": 14, "bt2020-12": 15, "smpte2084": 16, "smpte428": 17,
-    "arib-std-b67": 18,
-}
-_MATRIX_CODES = {
-    "gbr": 0, "bt709": 1, "unspecified": 2, "fcc": 4, "bt470bg": 5,
-    "smpte170m": 6, "smpte240m": 7, "ycgco": 8, "bt2020nc": 9,
-    "bt2020c": 10, "smpte2085": 11, "chroma-derived-nc": 12,
-    "chroma-derived-c": 13, "ictcp": 14,
-}
-
-
-def _color_metadata_bsf_args(source_video: str) -> list[str]:
-    """
-    Build `-bsf:v h264_metadata=...` args that tag the Remotion H.264 output
-    with the source video's color metadata. Returns [] if no tags are known,
-    which lets the remux run as a pure stream-copy.
-    """
-    info = _probe_color_metadata(source_video)
-    kv = []
-
-    primaries = _COLOUR_PRIMARIES_CODES.get((info.get("color_primaries") or "").lower())
-    if primaries is not None:
-        kv.append(f"colour_primaries={primaries}")
-
-    transfer = _TRANSFER_CODES.get((info.get("color_transfer") or "").lower())
-    if transfer is not None:
-        kv.append(f"transfer_characteristics={transfer}")
-
-    matrix = _MATRIX_CODES.get((info.get("color_space") or "").lower())
-    if matrix is not None:
-        kv.append(f"matrix_coefficients={matrix}")
-
-    color_range = (info.get("color_range") or "").lower()
-    if color_range in {"tv", "limited", "mpeg"}:
-        kv.append("video_full_range_flag=0")
-    elif color_range in {"pc", "full", "jpeg"}:
-        kv.append("video_full_range_flag=1")
-
-    if not kv:
-        return []
-    return ["-bsf:v", "h264_metadata=" + ":".join(kv)]
-
-
-def _remux_with_color_tags(remotion_out: str, source_video: str, final_out: str) -> None:
-    """Copy the Remotion output to final_out while tagging color metadata."""
-    bsf_args = _color_metadata_bsf_args(source_video)
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", remotion_out,
-        "-c", "copy",
-        "-map", "0",
-        "-movflags", "+faststart",
-        *bsf_args,
-        final_out,
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    return public_dir, font_basename
 
 
 def _remotion_available() -> bool:
     """Remotion needs node_modules installed in the broll-renderer folder."""
     return os.path.isdir(os.path.join(REMOTION_DIR, "node_modules"))
+
+
+def _remotion_concurrency() -> str:
+    """
+    Pick a Remotion worker count. Override via env CAPTIONS_REMOTION_CONCURRENCY.
+    Default: CPU count - 2 (leaves headroom for the OS and the main Python
+    process), clamped to at least 2. Each Chrome worker uses ~400MB RAM.
+    """
+    override = os.environ.get("CAPTIONS_REMOTION_CONCURRENCY", "").strip()
+    if override:
+        return override
+    cpu = os.cpu_count() or 4
+    return str(max(2, cpu - 2))
+
+
+def _composite_overlay_with_ffmpeg(
+    source_video: str, overlay_mov: str, output_path: str,
+) -> None:
+    """
+    Overlay the transparent caption track (ProRes 4444 w/ alpha) onto the
+    untouched source video in a single FFmpeg pass. Audio is stream-copied
+    from the source; the video is re-encoded using the pipeline's standard
+    fast-high-quality encoder (VideoToolbox H.264 on macOS) which preserves
+    the source color tags.
+    """
+    encode_args = build_fast_pipeline_encode_args(source_video)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", source_video,
+        "-i", overlay_mov,
+        "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=0[v]",
+        "-map", "[v]",
+        "-map", "0:a?",
+        "-map_metadata", "0",
+        *encode_args,
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
 def _render_with_remotion(
@@ -319,9 +282,21 @@ def _render_with_remotion(
     tmp_dir: str,
     base: str,
 ) -> None:
-    """Invoke `npx remotion render CaptionsComposition` and remux the result."""
-    public_dir, video_basename, font_basename = _setup_remotion_public_dir(
-        tmp_dir, base, input_video, font_path,
+    """
+    Two-stage render that bypasses the slowest part of the old approach
+    (Chrome headless decoding every frame of the full source video):
+
+    1. Remotion renders ONLY the transparent caption overlay, as a ProRes
+       4444 .mov with alpha. Chrome paints nearly-empty frames, so this is
+       ~10x faster than compositing the whole video in-browser.
+    2. FFmpeg overlays the caption track on the untouched source video in
+       a single pass (audio stream-copied, video re-encoded with the
+       pipeline's standard VideoToolbox H.264 path that preserves color
+       tags). Because the main video's pixels are never decoded by Chrome,
+       there is no quality loss on the source.
+    """
+    public_dir, font_basename = _setup_remotion_public_dir(
+        tmp_dir, base, font_path,
     )
 
     duration_frames = max(1, int(round(geometry["duration"] * geometry["fps"])))
@@ -332,7 +307,9 @@ def _render_with_remotion(
         "width": geometry["width"],
         "height": geometry["height"],
         "durationInFrames": duration_frames,
-        "mainVideoSrc": video_basename,
+        # mainVideoSrc is intentionally empty: the composition's
+        # renderMainVideo=false branch skips <OffthreadVideo> entirely.
+        "mainVideoSrc": "",
         "fontSrc": font_basename,
         "captions": captions,
         "fontSize": FONT_SIZE,
@@ -342,39 +319,46 @@ def _render_with_remotion(
         "shadowBlurPx": float(FONT_SIZE) * SHADOW_BLUR,
         "yFromBottom": max(0, y_from_bottom),
         "padding": PADDING,
+        "renderMainVideo": False,
     }
 
     props_path = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions.props.json"))
-    remotion_out = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions_remotion.mp4"))
+    # ProRes 4444 natively carries alpha; h264/mp4 cannot, so the overlay is
+    # written as a .mov.
+    overlay_mov = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions_overlay.mov"))
 
     with open(props_path, "w", encoding="utf-8") as f:
         json.dump(props, f, ensure_ascii=False)
 
+    concurrency = _remotion_concurrency()
     cmd = [
         "npx", "remotion", "render",
         "src/index.tsx", REMOTION_COMPOSITION_ID,
-        remotion_out,
+        overlay_mov,
         "--props", props_path,
-        "--codec", "h264",
-        "--crf", "17",
-        "--x264-preset", "veryfast",
-        "--concurrency", "10",
+        "--codec", "prores",
+        "--prores-profile", "4444",
+        "--pixel-format", "yuva444p10le",
+        # Alpha-bearing pixel formats require PNG frame intermediates;
+        # Remotion's default (JPEG) has no alpha channel and is rejected.
+        "--image-format", "png",
+        "--concurrency", concurrency,
         "--public-dir", public_dir,
-        "--color-space", "bt709",
         "--log", "error",
     ]
-    print(f"[09] Rendering captions via Remotion ({len(captions)} caption blocks, "
-          f"{duration_frames} frames @ {props['fps']}fps)...")
+    print(f"[09] Rendering captions overlay via Remotion "
+          f"({len(captions)} blocks, {duration_frames} frames @ "
+          f"{props['fps']}fps, concurrency={concurrency})...")
     subprocess.run(cmd, cwd=REMOTION_DIR, check=True)
 
-    if not os.path.isfile(remotion_out) or os.path.getsize(remotion_out) == 0:
-        raise RuntimeError(f"[09] Remotion produced no output at {remotion_out}")
+    if not os.path.isfile(overlay_mov) or os.path.getsize(overlay_mov) == 0:
+        raise RuntimeError(f"[09] Remotion produced no overlay at {overlay_mov}")
 
-    print("[09] Applying source color tags...")
-    _remux_with_color_tags(remotion_out, input_video, output_path)
+    print("[09] Compositing overlay onto source video via FFmpeg...")
+    _composite_overlay_with_ffmpeg(input_video, overlay_mov, output_path)
 
     try:
-        os.remove(remotion_out)
+        os.remove(overlay_mov)
         os.remove(props_path)
     except OSError:
         pass
@@ -420,6 +404,8 @@ def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "outp
 
     # Resolve input video (skip empty/corrupt intermediates)
     candidates = [
+        os.path.join(tmp_dir, f"{base}_dataviz.mp4"),
+        os.path.join(tmp_dir, f"{base}_fx.mp4"),
         os.path.join(tmp_dir, f"{base}_broll.mp4"),
         os.path.join(tmp_dir, f"{base}_hardcut.mp4"),
         os.path.join(tmp_dir, f"{base}_effects.mp4"),

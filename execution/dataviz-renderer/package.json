@@ -1,0 +1,14 @@
+{
+  "name": "dataviz-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HyperFrames project that renders fullscreen data-viz overlays (percentage rings, etc.) injected at AI-detected moments during step 08e.",
+  "scripts": {
+    "lint": "npx hyperframes lint",
+    "render": "npx hyperframes render --quality standard"
+  },
+  "dependencies": {
+    "hyperframes": "^0.4.12",
+    "puppeteer": "^24.0.0"
+  }
+}

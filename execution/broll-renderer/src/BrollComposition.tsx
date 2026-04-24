@@ -22,7 +22,7 @@ export type BrollSegment = {
   durationFrames: number;
   animation: "slide-left" | "slide-right" | "slide-up" | "scale-in" | "none";
   splitRatio: number;
-  position: "left" | "right" | "top" | "bottom";
+  position: "left" | "right" | "top" | "bottom" | "fullscreen";
 };
 
 type Props = {

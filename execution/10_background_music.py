@@ -8,11 +8,11 @@ import os
 import random
 import subprocess
 
-from video_encoding import first_existing_nonempty_video
+from video_encoding import build_fast_pipeline_encode_args, first_existing_nonempty_video
 
 # --- Config ---
-MUSIC_VOLUME = 0.10        # 0.0 to 1.0 — how loud the music is relative to original audio
-FADE_OUT_DURATION = 3.0    # seconds of fade out at the end
+MUSIC_VOLUME = 0.20        # 0.0 to 1.0 — how loud the music is relative to original audio
+FADE_OUT_DURATION = 0    # seconds of fade out at the end
 MUSIC_DIR = "music"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac", ".opus"}
@@ -49,6 +49,8 @@ def add_background_music(video_path: str, tmp_dir: str = ".tmp",
     # Resolve input: prefer final, then intermediates (skip empty files)
     candidates = [
         os.path.join(output_dir, f"{base}_final.mp4"),
+        os.path.join(tmp_dir, f"{base}_dataviz.mp4"),
+        os.path.join(tmp_dir, f"{base}_fx.mp4"),
         os.path.join(tmp_dir, f"{base}_broll.mp4"),
         os.path.join(tmp_dir, f"{base}_hardcut.mp4"),
         os.path.join(tmp_dir, f"{base}_effects.mp4"),
@@ -79,14 +81,11 @@ def add_background_music(video_path: str, tmp_dir: str = ".tmp",
     print(f"[10] Video: {video_duration:.1f}s, Track: {track_duration:.1f}s")
 
     # Build audio filter:
-    # 1. Loop music if needed to cover full video
-    # 2. Trim to video length
-    # 3. Apply volume
-    # 4. Fade out at the end
-    # 5. Mix with original audio
+    # Prepare music: loop if needed, trim, apply volume, fade, force stereo.
+    # Then merge with original audio and sum channels explicitly via `pan`
+    # so the original audio passes through at unit gain (no amix normalization).
     fade_start = max(0, video_duration - FADE_OUT_DURATION)
 
-    # Use aloop if track is shorter, otherwise just trim
     if track_duration < video_duration:
         loops_needed = int(video_duration / track_duration) + 1
         music_input = f"[1:a]aloop=loop={loops_needed}:size={int(track_duration * 48000)},"
@@ -98,23 +97,33 @@ def add_background_music(video_path: str, tmp_dir: str = ".tmp",
         f"atrim=0:{video_duration},"
         f"asetpts=PTS-STARTPTS,"
         f"volume={MUSIC_VOLUME},"
-        f"afade=t=out:st={fade_start}:d={FADE_OUT_DURATION}"
+        f"afade=t=out:st={fade_start}:d={FADE_OUT_DURATION},"
+        f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
         f"[music];"
-        f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[outa]"
+        f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[orig];"
+        f"[orig][music]amerge=inputs=2[merged];"
+        f"[merged]pan=stereo|c0=c0+c2|c1=c1+c3,"
+        f"atrim=0:{video_duration},asetpts=PTS-STARTPTS[outa]"
     )
 
     # If input and output are the same file, use a temp path
     use_temp = os.path.abspath(input_video) == os.path.abspath(output_path)
     actual_output = output_path + ".tmp.mp4" if use_temp else output_path
 
+    # Re-encode video with the same fast HQ path + color tags as 08b/08a/09 so
+    # the final file matches other pipeline exports (stream copy can leave
+    # players/QuickTime with inconsistent HDR/color interpretation vs input).
+    encode_args = build_fast_pipeline_encode_args(input_video)
     cmd = [
         "ffmpeg", "-y",
         "-i", input_video,
         "-i", track,
         "-filter_complex", audio_filter,
         "-map", "0:v", "-map", "[outa]",
-        "-c:v", "copy",
+        "-map_metadata", "0",
+        *encode_args,
         "-c:a", "alac",
+        "-movflags", "+faststart",
         actual_output,
     ]
 

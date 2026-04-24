@@ -14,6 +14,7 @@ def apply_studio_sound(video_path: str, tmp_dir: str = ".tmp") -> str:
     # the normal chain if the isolation step was skipped.
     for candidate in (
         os.path.join(tmp_dir, f"{base}_voice.mp4"),
+        os.path.join(tmp_dir, f"{base}_no_retakes.mp4"),
         os.path.join(tmp_dir, f"{base}_no_fillers.mp4"),
     ):
         if os.path.exists(candidate):

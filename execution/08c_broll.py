@@ -1,9 +1,13 @@
 """
-Step 8c: B-Roll Overlay — scans input/{base}/ for asset files (videos, images),
-analyzes transcript to find the best placement for each asset, then renders
-animated split-view overlays using Remotion and composites onto the main video.
+Step 8c: B-Roll Overlay — scans for asset files (videos, images) next to the
+original ingest under input/, then falls back to input/{base}/ when the source
+sits directly in input/. Analyzes transcript for placement, renders animated
+split-view overlays with Remotion, and composites onto the main video.
 
-Assets folder: input/{video_base_name}/
+Assets folder (first match wins):
+  - Same directory as the original source video under input/ (e.g.
+    input/project/clip.MOV → scan input/project/)
+  - If the source is directly in input/{base}.mov, use legacy input/{base}/
   - Supports: .mp4, .mov, .webm, .jpg, .jpeg, .png, .webp, .gif
   - Filenames can hint at content (e.g. "product.jpg", "store_front.mp4")
 
@@ -82,31 +86,153 @@ DEFAULT_REMOTION_WORKERS = 3
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
+# Extensions used when locating the original file under input/ (for assets dir).
+SOURCE_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
 
 ANIMATIONS = [ "none"]
 # POSITIONS = ["top", "bottom"]
 POSITIONS = ["bottom"]
+# Aspect ratio above which an asset is considered "vertical" (portrait).
+# Small slack so ~square 1:1 doesn't get treated as vertical.
+VERTICAL_ASPECT_THRESHOLD = 1.05
 MAX_LLM_SEGMENTS = 80
 MAX_LLM_SEGMENT_TEXT = 220
 MAX_LLM_NEIGHBOR_TEXT = 100
 
 
-def find_assets(video_path: str) -> list:
-    """Find assets in input/{base}/ folder."""
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    assets_dir = os.path.join("input", base)
+def _probe_asset_dimensions(path: str) -> tuple[int, int] | None:
+    """Return (width, height) for an image or video asset via ffprobe.
 
-    if not os.path.isdir(assets_dir):
+    ffprobe handles both still images and videos through a v:0 stream,
+    so one codepath covers `.jpg`, `.png`, `.mp4`, `.mov`, etc.
+    Returns None on failure so callers can fall back to split-panel layout.
+    """
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "json", path],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(probe.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return None
+        w = int(streams[0].get("width") or 0)
+        h = int(streams[0].get("height") or 0)
+        if w <= 0 or h <= 0:
+            return None
+        return w, h
+    except Exception:
+        return None
+
+
+def _is_vertical_asset(width: int, height: int) -> bool:
+    if width <= 0:
+        return False
+    return (height / width) >= VERTICAL_ASPECT_THRESHOLD
+
+
+def _find_input_source_paths_for_base(base: str, input_root: str) -> list[str]:
+    """Return absolute paths to video files under input_root named {base}.<ext>."""
+    if not base or not os.path.isdir(input_root):
+        return []
+    found: list[str] = []
+    for root, _dirs, files in os.walk(input_root):
+        for name in files:
+            if name.startswith("."):
+                continue
+            stem, ext = os.path.splitext(name)
+            if stem != base:
+                continue
+            if ext.lower() not in SOURCE_VIDEO_EXTENSIONS:
+                continue
+            p = os.path.join(root, name)
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    found.append(os.path.abspath(p))
+            except OSError:
+                continue
+    return found
+
+
+def _pick_input_source_path(candidates: list[str], input_abs: str) -> str | None:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Prefer shallowest path under input/, then shortest string (stable tie-break).
+    def sort_key(p: str) -> tuple[int, int, str]:
+        rel = os.path.relpath(p, input_abs)
+        depth = 0 if rel in (".", os.curdir) else rel.count(os.sep) + 1
+        return (depth, len(p), p)
+
+    return sorted(candidates, key=sort_key)[0]
+
+
+def resolve_broll_assets_directory(video_path: str) -> tuple[str | None, str]:
+    """Directory to scan for B-roll files, and the video basename stem.
+
+    Uses the folder that contains the original ingest under ``input/`` when
+    that folder is deeper than ``input/`` (assets live beside the source).
+    When the source file sits directly in ``input/``, uses legacy
+    ``input/{base}/`` so we do not scan all of ``input/``.
+    """
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    input_abs = os.path.abspath("input")
+    if not os.path.isdir(input_abs):
+        return None, base
+
+    abs_vp = os.path.abspath(video_path)
+    candidates: list[str] = []
+    seen_c: set[str] = set()
+
+    def add_cand(p: str) -> None:
+        p = os.path.abspath(p)
+        if p not in seen_c:
+            seen_c.add(p)
+            candidates.append(p)
+
+    if abs_vp.startswith(input_abs + os.sep):
+        add_cand(abs_vp)
+
+    for p in _find_input_source_paths_for_base(base, input_abs):
+        add_cand(p)
+
+    source_path = _pick_input_source_path(candidates, input_abs)
+    if source_path:
+        orig_dir = os.path.dirname(source_path)
+        if os.path.abspath(orig_dir) == input_abs:
+            legacy = os.path.join(input_abs, base)
+            return (legacy if os.path.isdir(legacy) else None), base
+        return orig_dir, base
+
+    legacy = os.path.join(input_abs, base)
+    return (legacy if os.path.isdir(legacy) else None), base
+
+
+def _is_primary_source_asset(filename: str, base: str) -> bool:
+    """True if this file is the main recording (same stem as pipeline base)."""
+    stem, ext = os.path.splitext(filename)
+    return stem == base and ext.lower() in SOURCE_VIDEO_EXTENSIONS
+
+
+def find_assets(video_path: str) -> list:
+    """Find images/videos for B-roll in the resolved assets directory."""
+    assets_dir, base = resolve_broll_assets_directory(video_path)
+    if not assets_dir:
         return []
 
     assets = []
     for f in sorted(os.listdir(assets_dir)):
+        if _is_primary_source_asset(f, base):
+            continue
         ext = os.path.splitext(f)[1].lower()
         full_path = os.path.abspath(os.path.join(assets_dir, f))
         if ext in IMAGE_EXTENSIONS:
-            assets.append({"path": full_path, "name": f, "type": "image"})
+            asset = {"path": full_path, "name": f, "type": "image"}
         elif ext in VIDEO_EXTENSIONS:
-            # Get video duration
             try:
                 probe = subprocess.run(
                     ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -114,9 +240,19 @@ def find_assets(video_path: str) -> list:
                     capture_output=True, text=True, check=True,
                 )
                 dur = float(probe.stdout.strip())
-                assets.append({"path": full_path, "name": f, "type": "video", "duration": dur})
+                asset = {"path": full_path, "name": f, "type": "video", "duration": dur}
             except Exception:
-                assets.append({"path": full_path, "name": f, "type": "video", "duration": 5.0})
+                asset = {"path": full_path, "name": f, "type": "video", "duration": 5.0}
+        else:
+            continue
+
+        dims = _probe_asset_dimensions(full_path)
+        if dims:
+            asset["width"], asset["height"] = dims
+            asset["is_vertical"] = _is_vertical_asset(*dims)
+        else:
+            asset["is_vertical"] = False
+        assets.append(asset)
 
     return assets
 
@@ -376,7 +512,12 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
         # Cycle through animation/position styles
         anim = ANIMATIONS[idx % len(ANIMATIONS)]
-        pos = POSITIONS[idx % len(POSITIONS)]
+        # Vertical assets take the entire screen; horizontal ones use the
+        # split panel (bottom/top/left/right) as before.
+        if asset.get("is_vertical"):
+            pos = "fullscreen"
+        else:
+            pos = POSITIONS[idx % len(POSITIONS)]
 
         placements.append({
             "asset": asset,
@@ -392,10 +533,17 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
 
 def calc_broll_dimensions(pos: str, vid_w: int, vid_h: int) -> tuple:
-    """Calculate B-roll inner dimensions and overlay position."""
+    """Calculate B-roll inner dimensions and overlay position.
+
+    `fullscreen` covers the entire main video (used for vertical assets on a
+    vertical main video). Other positions keep the original split-panel layout.
+    """
     vid_w = max(1, int(vid_w))
     vid_h = max(1, int(vid_h))
-    if pos in ("left", "right"):
+    if pos == "fullscreen":
+        bw = vid_w
+        bh = vid_h
+    elif pos in ("left", "right"):
         bw = min(vid_w, max(MIN_BROLL_PANEL, int(vid_w * SPLIT_RATIO)))
         bh = vid_h
     else:
@@ -411,7 +559,9 @@ def calc_broll_dimensions(pos: str, vid_w: int, vid_h: int) -> tuple:
     inner_w = bw - margin * 2
     inner_h = bh - margin * 2
 
-    if pos == "left":
+    if pos == "fullscreen":
+        x, y = margin, margin
+    elif pos == "left":
         x, y = margin, margin
     elif pos == "right":
         x, y = vid_w - bw + margin, margin
@@ -687,18 +837,25 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
     base = os.path.splitext(os.path.basename(video_path))[0]
 
     # Find assets
+    assets_dir, _ = resolve_broll_assets_directory(video_path)
     assets = find_assets(video_path)
     if not assets:
-        print(f"[08c] No assets folder found at input/{base}/, skipping B-roll.")
+        hint = (
+            os.path.abspath(assets_dir)
+            if assets_dir
+            else f"input/ (no folder beside source or input/{base}/)"
+        )
+        print(f"[08c] No B-roll assets found (looked under {hint}), skipping.")
         return ""
 
-    print(f"[08c] Found {len(assets)} assets in input/{base}/:")
+    print(f"[08c] Found {len(assets)} assets in {os.path.abspath(assets_dir)}:")
     for a in assets:
         print(f"  - {a['name']} ({a['type']})")
 
     # Resolve input video (skip empty/corrupt intermediates, e.g. failed 08b)
     candidates = [
         os.path.join(tmp_dir, f"{base}_hardcut.mp4"),
+        os.path.join(tmp_dir, f"{base}_multicam.mp4"),
         os.path.join(tmp_dir, f"{base}_effects.mp4"),
         os.path.join(tmp_dir, f"{base}_color.mp4"),
         os.path.join(tmp_dir, f"{base}_fixed_audio.mp4"),

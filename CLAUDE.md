@@ -51,6 +51,18 @@ Or process a specific video:
 python execution/run_pipeline.py input/my_video.mp4
 ```
 
+### Always-on pre-processing (recommended at session start)
+
+The watcher runs **step 00 only** when a new video lands in `input/`. Then: **trim** in `00b_editor.py` → **Mark trim done** — Whisper step 01 runs **automatically** in the background (disable with `EDITOR_AUTO_TRANSCRIBE=0`, then run `run_pipeline.py .tmp/BASE.mp4 --only 01`) → fix transcript in 00b → **Mark transcript review done** → run the rest:
+
+```bash
+python execution/watch_input.py                   # or: python execution/run_pipeline.py --watch
+# After transcript Save (debounced) or “Mark transcript review done”, steps 02+ run in the editor by default (EDITOR_AUTO_PIPELINE=0 to disable)
+python execution/run_pipeline.py input/BASE.mov --skip 00,01   # manual 02+ if auto-pipeline is off
+```
+
+See `directives/video_editing_pipeline.md` for the full always-on workflow.
+
 The pipeline runs 9 sequential steps (see `directives/video_editing_pipeline.md` for full SOP):
 1. Transcribe (Whisper) → 2. Remove retakes → 3. Remove fillers → 4. Studio Sound (EQ/compression/normalize) → 5. Fix mute gaps → 6. Scene detection → 7. Color correction → 8. Zoom/PAN face-tracking effects (every 6s) → 9. Captions (Clean Paragraph + fade)
 

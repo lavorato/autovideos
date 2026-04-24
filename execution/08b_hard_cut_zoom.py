@@ -4,20 +4,37 @@ shot every ~3 seconds with an instant cut (no transition/easing).
 Creates a dynamic, TikTok/YouTube-style pacing.
 
 Uses OpenCV Haar cascade for face detection (MediaPipe has protobuf issues).
+
+Optional semantic zoom moments via OpenRouter:
+  - OPENROUTER_API_KEY=<key>
+  - OPENROUTER_MODEL=<provider/model> or OPENROUTER_MODELS=<m1,m2,m3>
+When configured, the script asks the LLM to read the transcript and pick
+impactful moments (punchlines, key facts, emotional beats, CTAs). Those
+moments become the "tight zoom" windows; everything else stays wide. If
+the LLM returns no moments, the script falls back to the current fixed
+CUT_INTERVAL alternation.
 """
 import sys
 import os
 import json
 import math
 import platform
+import re
 import numpy as np
 import cv2
 import subprocess
+from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
 from video_encoding import build_fast_pipeline_encode_args
 
 # --- Config ---
-CUT_INTERVAL = 5.0       # seconds between each hard cut
+CUT_INTERVAL = 5.0       # seconds between each hard cut (fallback when no AI moments)
 ZOOM_LEVEL = 1.4         # how much to zoom in on tight shots
+AI_ZOOM_MIN_DURATION = 1.5   # clamp LLM moments below this
+AI_ZOOM_MAX_DURATION = 6.0   # clamp LLM moments above this
+AI_ZOOM_MAX_MOMENTS = 12     # hard cap on LLM-selected zoom windows
+AI_ZOOM_MIN_GAP = 1.5        # minimum wide gap between two zoom moments
+MAX_LLM_SEGMENTS = 120
+MAX_LLM_SEGMENT_TEXT = 220
 FACE_SAMPLE_FPS = 2.0    # frames/sec to sample for face detection (locked-per-segment
                          # only needs ~1 sample per segment; we keep a small margin).
 FACE_FOLLOW = False      # True = camera follows face each frame (smooth tracking)
@@ -187,10 +204,206 @@ def crop_and_resize(frame: np.ndarray, zoom: float, cx: float, cy: float) -> np.
     return resized
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Extract and parse the first JSON object found in text."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _load_transcript_segments(video_path: str, tmp_dir: str = ".tmp") -> list:
+    """Load segments from the Whisper transcript if present."""
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    transcript_path = os.path.join(tmp_dir, f"{base}_transcript.json")
+    if not os.path.exists(transcript_path):
+        return []
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[08b] Could not read transcript: {exc}")
+        return []
+    segs = data.get("segments") or []
+    return segs if isinstance(segs, list) else []
+
+
+def suggest_zoom_moments_with_openrouter(
+    segments: list,
+    models: list[str],
+    duration: float,
+) -> tuple[list, str | None]:
+    """Ask OpenRouter to pick the most impactful zoom-in moments.
+
+    Returns (moments, model_used). `moments` is a list of
+    ``{"start": float, "end": float, "reason": str}`` sorted by start time.
+    Empty list on failure.
+    """
+    if not segments or not models:
+        return [], None
+
+    capped = segments[:MAX_LLM_SEGMENTS]
+    payload_segments = []
+    for idx, seg in enumerate(capped):
+        text = (seg.get("text") or "").strip()
+        if len(text) > MAX_LLM_SEGMENT_TEXT:
+            text = text[:MAX_LLM_SEGMENT_TEXT] + "..."
+        payload_segments.append({
+            "index": idx,
+            "start": round(float(seg.get("start", 0.0)), 3),
+            "end": round(float(seg.get("end", seg.get("start", 0.0))), 3),
+            "text": text,
+        })
+
+    system_prompt = (
+        "You are a video editor analyzing a spoken transcript to find the most "
+        "impactful moments where a tight close-up zoom would add emphasis. "
+        "Pick only moments that actually benefit from a punch-in: a punchline, "
+        "a key insight or conclusion, a specific number/name/product, an "
+        "emotional beat, a rhetorical question, or a clear call-to-action. "
+        "Avoid filler chatter, generic transitions (so/then/and), small talk, "
+        "intros/outros, and housekeeping. It is perfectly fine to return zero "
+        "moments if nothing stands out. Return strict JSON only."
+    )
+    user_prompt = (
+        "Choose the zoom-in moments for this video.\n"
+        f"- Each moment must span {AI_ZOOM_MIN_DURATION}-{AI_ZOOM_MAX_DURATION} seconds "
+        "and align to complete spoken phrases.\n"
+        f"- Return at most {AI_ZOOM_MAX_MOMENTS} moments, spaced at least "
+        f"{AI_ZOOM_MIN_GAP}s apart.\n"
+        "- If no moments are strong enough, return an empty array.\n\n"
+        "Return exactly this JSON schema:\n"
+        '{ "moments": ['
+        '{ "start": 0.0, "end": 0.0, "reason": "short justification", '
+        '"confidence": 0.0 } ] }\n'
+        "- start and end are seconds from the provided segment timeline.\n"
+        "- end must be > start, both within [0, video_duration_sec].\n"
+        "- confidence is between 0 and 1.\n\n"
+        f"video_duration_sec: {round(float(duration), 3)}\n\n"
+        f"Segments:\n{json.dumps(payload_segments, ensure_ascii=False)}"
+    )
+
+    for model in models:
+        print(f"[08b] OpenRouter: trying model '{model}' for zoom moment detection...")
+        try:
+            response_text = chat_completion(
+                model=model,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.2,
+                max_tokens=900,
+            )
+        except Exception as exc:
+            print(f"[08b] OpenRouter '{model}' failed: {exc}")
+            continue
+
+        parsed = _extract_json_object(response_text)
+        if not parsed:
+            print(f"[08b] OpenRouter '{model}' returned non-JSON output.")
+            continue
+
+        raw_moments = parsed.get("moments", [])
+        if not isinstance(raw_moments, list):
+            print(f"[08b] OpenRouter '{model}' missing 'moments' array.")
+            continue
+
+        cleaned_moments = []
+        for item in raw_moments:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = float(item.get("start"))
+                end = float(item.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if not (end > start):
+                continue
+            start = max(0.0, min(start, duration))
+            end = max(0.0, min(end, duration))
+            dur = end - start
+            if dur < AI_ZOOM_MIN_DURATION:
+                end = min(duration, start + AI_ZOOM_MIN_DURATION)
+            if end - start > AI_ZOOM_MAX_DURATION:
+                end = start + AI_ZOOM_MAX_DURATION
+            if end - start < 0.5:
+                continue
+            cleaned_moments.append({
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "reason": str(item.get("reason", "")).strip()[:140],
+            })
+
+        cleaned_moments.sort(key=lambda m: m["start"])
+
+        # Enforce minimum gap between moments (drop ones too close to predecessor).
+        deduped = []
+        for m in cleaned_moments:
+            if deduped:
+                last_end = deduped[-1]["end"]
+                if m["start"] < last_end + AI_ZOOM_MIN_GAP:
+                    continue
+            deduped.append(m)
+            if len(deduped) >= AI_ZOOM_MAX_MOMENTS:
+                break
+
+        if deduped:
+            print(f"[08b] OpenRouter selected {len(deduped)} zoom moment(s) with model '{model}'.")
+            return deduped, model
+
+        print(f"[08b] OpenRouter '{model}' returned no usable moments.")
+
+    return [], None
+
+
+def _segments_from_zoom_moments(moments: list, duration: float) -> list:
+    """Interleave wide ranges between zoom moments, covering [0, duration].
+
+    Returns a list of tuples (start, end, is_zoomed).
+    """
+    if not moments:
+        return [(0.0, duration, False)]
+
+    result = []
+    cursor = 0.0
+    min_wide = 0.05
+    for m in moments:
+        m_start = max(cursor, float(m["start"]))
+        m_end = min(duration, float(m["end"]))
+        if m_end <= m_start:
+            continue
+        if m_start - cursor >= min_wide:
+            result.append((cursor, m_start, False))
+        result.append((m_start, m_end, True))
+        cursor = m_end
+    if duration - cursor >= min_wide:
+        result.append((cursor, duration, False))
+    return result
+
+
 def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
     base = os.path.splitext(os.path.basename(video_path))[0]
 
-    input_video = os.path.join(tmp_dir, f"{base}_effects.mp4")
+    input_video = os.path.join(tmp_dir, f"{base}_multicam.mp4")
+    if not os.path.exists(input_video):
+        input_video = os.path.join(tmp_dir, f"{base}_effects.mp4")
     if not os.path.exists(input_video):
         input_video = os.path.join(tmp_dir, f"{base}_color.mp4")
     if not os.path.exists(input_video):
@@ -222,35 +435,86 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
             f"{width}x{height}; crop/zoom uses FFmpeg size."
         )
 
-    segment_count = max(1, math.ceil(duration / CUT_INTERVAL))
-    total_cuts = max(0, segment_count - 1)
     mode = "follow" if FACE_FOLLOW else "lock"
-    print(f"[08b] Applying {total_cuts} hard cuts (every {CUT_INTERVAL}s) over {duration:.1f}s")
-    print(f"[08b] Zoom: wide=1.0x, tight={ZOOM_LEVEL}x, mode={mode}, resolution={width}x{height}")
-
     if FACE_FOLLOW:
         print("[08b] FACE_FOLLOW=True is not supported in FFmpeg segment mode; using locked face per segment.")
 
-    # Pre-compute locked face positions per segment (used when FACE_FOLLOW=False)
-    segment_face = {}
-    for seg_idx in range(segment_count):
-        seg_start = seg_idx * CUT_INTERVAL
-        cx, cy = get_face_at_time(positions, seg_start)
-        segment_face[seg_idx] = (cx, cy)
+    # ── Try LLM-driven zoom moments first ───────────────────────────────
+    ai_zoom_segments: list = []
+    ai_model: str | None = None
+    ai_moments: list = []
+    if has_openrouter_api_key():
+        candidate_models = parse_models_from_env()
+        if candidate_models:
+            transcript_segments = _load_transcript_segments(video_path, tmp_dir)
+            if transcript_segments:
+                moments, ai_model = suggest_zoom_moments_with_openrouter(
+                    segments=transcript_segments,
+                    models=candidate_models,
+                    duration=duration,
+                )
+                if moments:
+                    for m in moments:
+                        reason = f" — {m['reason']}" if m.get("reason") else ""
+                        print(f"  Zoom moment: {m['start']:.2f}s → {m['end']:.2f}s{reason}")
+                    ai_zoom_segments = _segments_from_zoom_moments(moments, duration)
+                    ai_moments = moments
+            else:
+                print("[08b] No transcript found; skipping AI zoom moment detection.")
+        else:
+            print("[08b] OPENROUTER_API_KEY found, but no OPENROUTER_MODEL(S) configured.")
+
+    # Persist AI moments (or empty list) so downstream steps — e.g. 08d FX
+    # sounds — know where the impactful beats are without re-querying the LLM.
+    moments_path = os.path.join(tmp_dir, f"{base}_zoom_moments.json")
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        with open(moments_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "video": video_path,
+                    "duration": round(float(duration), 3),
+                    "model": ai_model,
+                    "moments": ai_moments,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except OSError as exc:
+        print(f"[08b] Could not write zoom moments sidecar: {exc}")
+
+    # ── Build the FFmpeg segment list ───────────────────────────────────
+    if ai_zoom_segments:
+        segments_plan = ai_zoom_segments
+        zoom_count = sum(1 for s in segments_plan if s[2])
+        print(
+            f"[08b] Using AI-selected zoom moments ({zoom_count} tight, "
+            f"{len(segments_plan) - zoom_count} wide) via '{ai_model}'."
+        )
+    else:
+        print(f"[08b] Falling back to fixed {CUT_INTERVAL}s alternating cuts.")
+        segment_count = max(1, math.ceil(duration / CUT_INTERVAL))
+        segments_plan = []
+        for seg_idx in range(segment_count):
+            seg_start = seg_idx * CUT_INTERVAL
+            seg_end = min((seg_idx + 1) * CUT_INTERVAL, duration)
+            is_zoomed = (seg_idx % 2 == 1)
+            segments_plan.append((seg_start, seg_end, is_zoomed))
+
+    total_cuts = max(0, len(segments_plan) - 1)
+    print(f"[08b] Applying {total_cuts} hard cuts over {duration:.1f}s")
+    print(f"[08b] Zoom: wide=1.0x, tight={ZOOM_LEVEL}x, mode={mode}, resolution={width}x{height}")
 
     filter_parts = []
-    for seg_idx in range(segment_count):
-        seg_start = seg_idx * CUT_INTERVAL
-        seg_end = min((seg_idx + 1) * CUT_INTERVAL, duration)
+    for seg_idx, (seg_start, seg_end, is_zoomed) in enumerate(segments_plan):
         segment_filter = f"[0:v]trim=start={seg_start:.6f}:end={seg_end:.6f},setpts=PTS-STARTPTS"
-
-        is_zoomed = (seg_idx % 2 == 1)
         if is_zoomed:
-            cx, cy = segment_face.get(seg_idx, (0.5, 0.5))
+            cx, cy = get_face_at_time(positions, seg_start)
             segment_filter += zoom_crop_scale_ffmpeg(cx, cy, width, height, ZOOM_LEVEL)
-
         filter_parts.append(f"{segment_filter}[v{seg_idx}]")
 
+    segment_count = len(segments_plan)
     concat_inputs = "".join([f"[v{idx}]" for idx in range(segment_count)])
     filter_parts.append(f"{concat_inputs}concat=n={segment_count}:v=1:a=0[vout]")
     filter_complex = ";".join(filter_parts)
