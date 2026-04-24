@@ -239,6 +239,92 @@ def extract_keywords_from_filename(filename: str) -> list:
     return [w for w in words if len(w) > 2 and w not in stopwords and not w.isdigit()]
 
 
+def _segment_text_for_keywords(seg: dict) -> str:
+    """Segment text for keyword scoring: concat + space-joined word stream (clearer for Whisper)."""
+    t = (seg.get("text") or "").lower()
+    wlist = seg.get("words") or []
+    if isinstance(wlist, list) and wlist:
+        alt = " ".join(str(w.get("word", "")) for w in wlist if isinstance(w, dict)).lower()
+        if alt.strip():
+            return f"{t} {alt}"
+    return t
+
+
+def anchor_start_in_segment(segment: dict, keywords: list[str]) -> float:
+    """First spoken moment within *segment* that matches *keywords*; else segment start.
+
+    Uses per-word timestamps from the transcript. Clamped so the anchor is not
+    in the last 0.25s of the segment (keeps a minimal alignment margin).
+    """
+    seg_s = float(segment.get("start", 0.0) or 0.0)
+    seg_e = float(segment.get("end", seg_s) or seg_s)
+    if seg_e < seg_s:
+        seg_e = seg_s
+
+    upper = max(seg_s, seg_e - 0.25)
+    best: float | None = None
+
+    if keywords:
+        wrows = segment.get("words")
+        if isinstance(wrows, list) and wrows:
+            for w in wrows:
+                if not isinstance(w, dict):
+                    continue
+                wtext = str(w.get("word", "")).lower()
+                if not any(kw in wtext for kw in keywords if kw):
+                    continue
+                try:
+                    ws = float(w.get("start", seg_s))
+                except (TypeError, ValueError):
+                    ws = seg_s
+                if best is None or ws < best:
+                    best = ws
+
+    if best is None:
+        anchor = seg_s
+    else:
+        anchor = best
+
+    anchor = min(max(anchor, seg_s), upper)
+    return anchor
+
+
+def _resolve_broll_start_time(
+    matched_seg: dict | None,
+    asset: dict,
+) -> float:
+    """Ideal overlay start: word-anchored when segment + filename keywords allow."""
+    if not matched_seg:
+        return 0.0
+    kws = extract_keywords_from_filename(asset.get("name", ""))
+    return anchor_start_in_segment(matched_seg, kws)
+
+
+def _pack_broll_no_overlap(
+    ideal_start: float,
+    broll_dur: float,
+    video_duration: float,
+    used: list[tuple[float, float]],
+) -> tuple[float, float] | None:
+    """Slide the [t, t+broll_dur) window forward until it does not overlap *used* (non-destructive to order)."""
+    if video_duration <= 0.0:
+        return None
+    tail = max(0.0, video_duration - 0.5)
+    t = max(0.0, float(ideal_start))
+    for _ in range(len(used) * 2 + 128):
+        end = min(t + broll_dur, tail)
+        if end <= t:
+            return None
+        new_t = t
+        for us, ue in used:
+            if t < ue and end > us:
+                new_t = max(new_t, ue)
+        if new_t - t < 1e-9:
+            return (t, end)
+        t = new_t
+    return None
+
+
 def _extract_json_object(text: str) -> dict | None:
     """Extract and parse the first JSON object found in text."""
     if not text:
@@ -394,12 +480,6 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
     placements = []
     used_time_ranges = []
 
-    def overlaps(start, end):
-        for us, ue in used_time_ranges:
-            if start < ue and end > us:
-                return True
-        return False
-
     def find_best_segment(asset, available_segments):
         """Try keyword match first, then fall back to spacing."""
         keywords = extract_keywords_from_filename(asset["name"])
@@ -408,7 +488,7 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
         if keywords:
             for seg in available_segments:
-                text = seg.get("text", "").lower()
+                text = _segment_text_for_keywords(seg)
                 score = sum(1 for kw in keywords if kw in text)
                 if score > best_score:
                     best_score = score
@@ -417,7 +497,6 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
     # Sort segments by start time
     sorted_segments = sorted(segments, key=lambda s: s.get("start", 0))
-    available = list(sorted_segments)
 
     llm_mapping = {}
     llm_model = None
@@ -445,17 +524,19 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
         # Fallback: local keyword matching.
         if matched_seg is None:
-            matched_seg = find_best_segment(asset, available)
+            matched_seg = find_best_segment(asset, sorted_segments)
 
         if matched_seg:
-            start_time = matched_seg["start"]
+            start_time = _resolve_broll_start_time(matched_seg, asset)
         else:
             # Evenly distribute across video duration
             spacing = video_duration / (len(assets) + 1)
-            start_time = spacing * (idx + 1)
-            # Snap to nearest segment start for natural placement
-            closest = min(sorted_segments, key=lambda s: abs(s["start"] - start_time))
-            start_time = closest["start"]
+            ideal = spacing * (idx + 1)
+            # Snap to nearest segment, then word-anchor within it
+            closest = min(sorted_segments, key=lambda s: abs(s["start"] - ideal))
+            start_time = anchor_start_in_segment(
+                closest, extract_keywords_from_filename(asset["name"])
+            )
 
         # Determine duration
         if asset["type"] == "video" and "duration" in asset:
@@ -463,21 +544,13 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
         else:
             broll_dur = random.uniform(MIN_BROLL_DURATION, MAX_BROLL_DURATION)
 
-        end_time = min(start_time + broll_dur, video_duration - 0.5)
-
-        # Avoid overlap with existing placements
-        if overlaps(start_time, end_time):
-            # Shift forward
-            for seg in sorted_segments:
-                test_start = seg["start"]
-                test_end = min(test_start + broll_dur, video_duration - 0.5)
-                if not overlaps(test_start, test_end) and test_start > 2.0:
-                    start_time = test_start
-                    end_time = test_end
-                    break
-
-        if overlaps(start_time, end_time):
-            continue  # skip if still overlapping
+        # Slide forward in time only (keeps B-roll after its ideal moment vs arbitrary segment jumps)
+        packed = _pack_broll_no_overlap(
+            start_time, broll_dur, video_duration, used_time_ranges
+        )
+        if packed is None:
+            continue
+        start_time, end_time = packed
 
         used_time_ranges.append((start_time, end_time))
 
@@ -845,10 +918,17 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
     # Load transcript
     transcript_path = os.path.join(tmp_dir, f"{base}_transcript.json")
     segments = []
+    transcript_video_duration: float | None = None
     if os.path.exists(transcript_path):
         with open(transcript_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         segments = data.get("segments", [])
+        raw_dur = data.get("video_duration")
+        if raw_dur is not None:
+            try:
+                transcript_video_duration = float(raw_dur)
+            except (TypeError, ValueError):
+                transcript_video_duration = None
 
     # Get video info
     probe = subprocess.run(
@@ -879,6 +959,12 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
         fps = float(fps_str)
 
     print(f"[08c] Video: {vid_w}x{vid_h}, {duration:.1f}s, {fps:.2f}fps")
+    if transcript_video_duration is not None and abs(duration - transcript_video_duration) > 0.5:
+        print(
+            "[08c] Warning: video duration differs from transcript video_duration "
+            f"({duration:.3f}s vs {transcript_video_duration:.3f}s); "
+            "B-roll timing may be wrong if the transcript is stale."
+        )
 
     # Match assets to transcript
     placements = match_assets_to_segments(assets, segments, duration)
