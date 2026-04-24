@@ -28,46 +28,11 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
 from video_encoding import (
-    build_fast_hq_x264_args,
+    build_color_preserving_composite_encode_args,
     first_existing_nonempty_video,
-    _probe_color_metadata,
+    source_color_normalize_filter,
 )
-
-
-def _build_color_preserving_encode_args(main_video: str) -> list[str]:
-    """Encoder args for the B-roll composite pass that do NOT shift colors.
-
-    We intentionally avoid `h264_videotoolbox` here: on macOS builds it
-    silently drops color_primaries / color_trc / colorspace tags and bakes
-    in a BT.709 assumption, which produces a visible color shift vs. the
-    source after this step re-encodes the whole main video. libx264 at
-    crf 16 is visually lossless for an intermediate pipeline step and
-    keeps the source color tags intact.
-    """
-    return build_fast_hq_x264_args(main_video, crf=16, preset="veryfast")
-
-
-def _source_color_filter(video_path: str) -> str:
-    """Build a filter chain fragment that normalizes pixel format to yuv420p
-    and re-applies the source's color tags, so the FFmpeg overlay pass can't
-    silently renegotiate colorspace on us."""
-    info = _probe_color_metadata(video_path)
-    parts = ["format=yuv420p"]
-
-    mapping = {
-        "color_primaries": "color_primaries",
-        "color_trc": "color_trc",
-        "colorspace": "color_space",
-        "range": "color_range",
-    }
-    setparams_kv = []
-    for ff_key, src_key in mapping.items():
-        value = info.get(src_key)
-        if value and value != "unknown":
-            setparams_kv.append(f"{ff_key}={value}")
-    if setparams_kv:
-        parts.append("setparams=" + ":".join(setparams_kv))
-    return ",".join(parts)
+from editor_gate import stem_for_editor_gate
 
 # --- Config ---
 MIN_BROLL_DURATION = 3.0  # seconds minimum per b-roll
@@ -171,6 +136,12 @@ def _pick_input_source_path(candidates: list[str], input_abs: str) -> str | None
     return sorted(candidates, key=sort_key)[0]
 
 
+def _ingest_stem_from_video_path(video_path: str) -> str:
+    """Stem of the original ingest (e.g. IMG_1792), not the latest pipeline .mp4 name."""
+    raw = os.path.splitext(os.path.basename(video_path))[0]
+    return stem_for_editor_gate(raw)
+
+
 def resolve_broll_assets_directory(video_path: str) -> tuple[str | None, str]:
     """Directory to scan for B-roll files, and the video basename stem.
 
@@ -179,7 +150,7 @@ def resolve_broll_assets_directory(video_path: str) -> tuple[str | None, str]:
     When the source file sits directly in ``input/``, uses legacy
     ``input/{base}/`` so we do not scan all of ``input/``.
     """
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    base = _ingest_stem_from_video_path(video_path)
     input_abs = os.path.abspath("input")
     if not os.path.isdir(input_abs):
         return None, base
@@ -713,7 +684,7 @@ def composite_broll_clips(placements: list, clip_paths: list,
     # Lock the main video into yuv420p with its original color tags so the
     # overlay filter can't implicitly renegotiate colorspace between the
     # main video and the Remotion clips (which are bt709 yuv420p).
-    src_fmt = _source_color_filter(main_video)
+    src_fmt = source_color_normalize_filter(main_video)
     filter_parts.append(f"[0:v]{src_fmt}[bg]")
     current_label = "[bg]"
 
@@ -756,7 +727,7 @@ def composite_broll_clips(placements: list, clip_paths: list,
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", current_label, "-map", "0:a",
-        *_build_color_preserving_encode_args(main_video),
+        *build_color_preserving_composite_encode_args(main_video),
         "-c:a", "copy",
         output_path,
     ]
@@ -785,7 +756,7 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
     # Same color-preserving preamble as composite_broll_clips — force the
     # main video into a known pixel format with the source's color tags so
     # overlay cannot auto-negotiate into a slightly different colorspace.
-    src_fmt = _source_color_filter(main_video)
+    src_fmt = source_color_normalize_filter(main_video)
     filter_parts.append(f"[0:v]{src_fmt}[bg]")
     current_label = "[bg]"
 
@@ -820,7 +791,7 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", current_label, "-map", "0:a",
-        *_build_color_preserving_encode_args(main_video),
+        *build_color_preserving_composite_encode_args(main_video),
         "-c:a", "copy",
         output_path,
     ]
@@ -834,7 +805,7 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
 
 
 def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    base = _ingest_stem_from_video_path(video_path)
 
     # Find assets
     assets_dir, _ = resolve_broll_assets_directory(video_path)

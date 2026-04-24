@@ -140,6 +140,43 @@ def build_videotoolbox_h264_args(
     ]
 
 
+def source_color_normalize_filter(video_path: str) -> str:
+    """
+    FFmpeg filter chain fragment: force yuv420p and re-apply the source stream's
+    color metadata via setparams. Use on the main video before ``overlay`` so
+    FFmpeg does not implicitly renegotiate colorspace against overlay inputs
+    (e.g. Remotion/bt709 clips). Same behavior as step 08c b-roll composite.
+    """
+    stream_info = _probe_color_metadata(video_path)
+    parts = ["format=yuv420p"]
+    mapping = {
+        "color_primaries": "color_primaries",
+        "color_trc": "color_trc",
+        "colorspace": "color_space",
+        "range": "color_range",
+    }
+    setparams_kv: list[str] = []
+    for ff_key, src_key in mapping.items():
+        value = stream_info.get(src_key)
+        if value and value != "unknown":
+            setparams_kv.append(f"{ff_key}={value}")
+    if setparams_kv:
+        parts.append("setparams=" + ":".join(setparams_kv))
+    return ",".join(parts)
+
+
+def build_color_preserving_composite_encode_args(video_path: str) -> list[str]:
+    """
+    Encoder args for overlay/composite passes that must match step 08c output.
+
+    Avoid ``h264_videotoolbox`` here: on macOS it can drop or mishandle
+    color_primaries / color_trc / colorspace in a way that visibly shifts
+    colors vs. the rest of the pipeline. libx264 at crf 16 (veryfast) matches
+    the b-roll composite and keeps tagged color metadata consistent.
+    """
+    return build_fast_hq_x264_args(video_path, crf=16, preset="veryfast")
+
+
 def build_fast_pipeline_encode_args(video_path: str) -> list[str]:
     """
     Preferred fast-but-high-quality encoder for intermediate pipeline steps.

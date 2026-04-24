@@ -8,7 +8,10 @@ import os
 import random
 import subprocess
 
-from video_encoding import build_fast_pipeline_encode_args, first_existing_nonempty_video
+from video_encoding import (
+    build_color_preserving_composite_encode_args,
+    first_existing_nonempty_video,
+)
 
 # --- Config ---
 MUSIC_VOLUME = 0.20        # 0.0 to 1.0 — how loud the music is relative to original audio
@@ -110,10 +113,9 @@ def add_background_music(video_path: str, tmp_dir: str = ".tmp",
     use_temp = os.path.abspath(input_video) == os.path.abspath(output_path)
     actual_output = output_path + ".tmp.mp4" if use_temp else output_path
 
-    # Re-encode video with the same fast HQ path + color tags as 08b/08a/09 so
-    # the final file matches other pipeline exports (stream copy can leave
-    # players/QuickTime with inconsistent HDR/color interpretation vs input).
-    encode_args = build_fast_pipeline_encode_args(input_video)
+    # Re-encode video with the same libx264 settings as 08c/09 so the final
+    # file matches the b-roll/captions chain (VideoToolbox can shift colors).
+    encode_args = build_color_preserving_composite_encode_args(input_video)
     cmd = [
         "ffmpeg", "-y",
         "-i", input_video,

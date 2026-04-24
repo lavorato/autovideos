@@ -22,10 +22,12 @@ import captacity
 from captacity import segment_parser
 from moviepy import CompositeVideoClip
 
+from editor_gate import stem_for_editor_gate
 from video_encoding import (
-    build_fast_pipeline_encode_args,
+    build_color_preserving_composite_encode_args,
     build_moviepy_lossless_params,
     first_existing_nonempty_video,
+    source_color_normalize_filter,
 )
 
 
@@ -252,16 +254,18 @@ def _composite_overlay_with_ffmpeg(
     """
     Overlay the transparent caption track (ProRes 4444 w/ alpha) onto the
     untouched source video in a single FFmpeg pass. Audio is stream-copied
-    from the source; the video is re-encoded using the pipeline's standard
-    fast-high-quality encoder (VideoToolbox H.264 on macOS) which preserves
-    the source color tags.
+    from the source; video is re-encoded with the same libx264 + color
+    normalization as step 08c (not VideoToolbox), so the exported final
+    matches the b-roll composite's color and quality.
     """
-    encode_args = build_fast_pipeline_encode_args(source_video)
+    src_vf = source_color_normalize_filter(source_video)
+    encode_args = build_color_preserving_composite_encode_args(source_video)
     cmd = [
         "ffmpeg", "-y",
         "-i", source_video,
         "-i", overlay_mov,
-        "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:shortest=0[v]",
+        "-filter_complex",
+        f"[0:v]{src_vf}[main];[main][1:v]overlay=0:0:format=auto:shortest=0[v]",
         "-map", "[v]",
         "-map", "0:a?",
         "-map_metadata", "0",
@@ -291,8 +295,8 @@ def _render_with_remotion(
        ~10x faster than compositing the whole video in-browser.
     2. FFmpeg overlays the caption track on the untouched source video in
        a single pass (audio stream-copied, video re-encoded with the
-       pipeline's standard VideoToolbox H.264 path that preserves color
-       tags). Because the main video's pixels are never decoded by Chrome,
+       same libx264 + color normalization as the b-roll composite pass).
+       Because the main video's pixels are never decoded by Chrome,
        there is no quality loss on the source.
     """
     public_dir, font_basename = _setup_remotion_public_dir(
@@ -400,7 +404,11 @@ def _render_with_captacity(
 
 
 def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "output") -> str:
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    # run_pipeline swaps video_path to each step's output (.tmp/{stem}_dataviz.mp4, …).
+    # Transcripts and intermediates are keyed by the ingest stem (post-trim), e.g.
+    # .tmp/IMG_17922_transcript.json — not …_dataviz_transcript.json.
+    raw_stem = os.path.splitext(os.path.basename(video_path))[0]
+    base = stem_for_editor_gate(raw_stem)
 
     # Resolve input video (skip empty/corrupt intermediates)
     candidates = [

@@ -1,6 +1,6 @@
 """
-Step 10 (background music) should re-encode with build_fast_pipeline_encode_args
-so color metadata matches other pipeline export steps. Compare ffprobe fields.
+Step 10 (background music) should re-encode with the same color-preserving
+libx264 path as 08c/09. Compare ffprobe fields.
 """
 from __future__ import annotations
 
