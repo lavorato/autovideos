@@ -33,7 +33,7 @@ python execution/00b_editor.py            # trim primeiro; sidebar → "Mark tri
 # (transcrição: ao marcar trim no 00b corre em segundo plano por defeito;
 #  ou ``python execution/run_pipeline.py .tmp/IMG_1792.mp4 --only 01`` se EDITOR_AUTO_TRANSCRIBE=0)
 
-# terminal 3 — após transcrever: editar e **Save** no 00b (pipeline 02+ inicia sozinho por defeito), ou ``--skip 00,01`` manual se ``EDITOR_AUTO_PIPELINE=0``
+# terminal 3 — após transcrever: **Save** (só grava) ou **Save and continue** no 00b (02+ inicia com debounce se ``EDITOR_AUTO_PIPELINE=1``), ou ``--skip 00,01`` manual
 python execution/run_pipeline.py input/IMG_1792.MOV --skip 00,01   # só necessário com auto-pipeline desligado
 ```
 
@@ -56,8 +56,8 @@ Flags do watcher: `--interval <sec>`, `--input-dir <path>`, `--tmp-dir <path>`, 
 - UI web local única (glassmorphism) que funde as duas ferramentas interativas antigas (`00b_trim_video.py` + `01b_fix_transcript.py`) em um só app.
 - Ao abrir, mostra uma **sidebar com a lista de arquivos editáveis em `.tmp/`** agrupados por basename: cada grupo lista o `.mp4` (modo “Video trim”) e o `*_transcript.json` (modo “Transcript”). Clicar em um item troca o painel da direita para o editor apropriado.
 - Modo **Video trim**: player HTML5 + timeline com marcadores de corte, atalhos `Space` play/pause · `←/→` ±0.1s · `Shift+←/→` ±1s · `I`/`O` cut-in/cut-out · `[`/`]` trim start/end. Ao salvar, o FFmpeg renderiza os segmentos mantidos (`filter_complex trim+atrim+concat`) e sobrescreve `.tmp/{base}.mp4` atomicamente, criando `.tmp/{base}.mp4.bak` no primeiro save.
-- Modo **Transcript**: find/replace ciente de pontuação sobre `words`/`segments[*].words`/`text`, com lista de palavras únicas na lateral e histórico das substituições. Save cria `.bak` do JSON no primeiro save.
-- **Passo manual**: não entra sozinho no `run_pipeline`. Ordem: **trim** → **Mark trim done** → **passo 01** sobre `.tmp/{base}.mp4` → **transcript** → **Mark transcript review done** → passos 02+.
+- Modo **Transcript**: find/replace ciente de pontuação sobre `words`/`segments[*].words`/`text`, com lista de palavras únicas na lateral e histórico das substituições. **Save** grava o JSON (`.bak` no primeiro save) sem avançar; **Save and continue** confirma a revisão e inicia 02+ (ou só escreve o gate se `EDITOR_AUTO_PIPELINE=0`, usando **Run 02+** depois).
+- **Passo manual**: não entra sozinho no `run_pipeline`. Ordem: **trim** → **Mark trim done** → **passo 01** sobre `.tmp/{base}.mp4` → **transcript** → **Save and continue** ou **Mark transcript review done** → passos 02+.
   ```bash
   python execution/00b_editor.py                              # abre sidebar com .tmp/
   python execution/00b_editor.py .tmp/IMG_1792.mp4            # pré-abre em Video trim
@@ -66,7 +66,7 @@ Flags do watcher: `--interval <sec>`, `--input-dir <path>`, `--tmp-dir <path>`, 
   python execution/00b_editor.py --mark-trim-done .tmp/IMG_1792.mp4
   python execution/00b_editor.py --mark-done .tmp/IMG_1792.mp4   # após existir transcript
   ```
-- **Gates** (ficheiro `.tmp/{base}_editor_review.json`): **trim confirmado** antes do passo 01; **revisão da transcrição** antes dos passos 02+. Após **Mark trim done**, o passo 01 corre **automaticamente** no `00b_editor` (`EDITOR_AUTO_TRANSCRIBE`, defeito ligado). Após **Save** na transcrição, os passos 02+ arrancam sozinhos após um debounce (`EDITOR_AUTO_PIPELINE`, defeito ligado; `EDITOR_AUTO_PIPELINE_DEBOUNCE` em segundos, defeito 3). **Mark transcript review done** confirma revisão e inicia o pipeline já. `EDITOR_AUTO_PIPELINE=0` — só `run_pipeline.py --skip 00,01` manual. Novo trim apaga o marker. Bypass: `--skip-editor-gate` / `PIPELINE_SKIP_EDITOR_GATE=1`.
+- **Gates** (ficheiro `.tmp/{base}_editor_review.json`): **trim confirmado** antes do passo 01; **revisão da transcrição** antes dos passos 02+. Após **Mark trim done**, o passo 01 corre **automaticamente** no `00b_editor` (`EDITOR_AUTO_TRANSCRIBE`, defeito ligado). **Save and continue** na transcrição (não o **Save** simples) dispara 02+ após debounce se `EDITOR_AUTO_PIPELINE` estiver ligado; com `EDITOR_AUTO_PIPELINE=0`, grava o marker e usa **Run 02+** ou `run_pipeline.py --skip 00,01`. **Mark transcript review done** continua a confirmar e a iniciar o pipeline. Novo trim apaga o marker. Bypass: `--skip-editor-gate` / `PIPELINE_SKIP_EDITOR_GATE=1`.
 - Como os arquivos mantêm o mesmo basename `{base}`, todos os intermediários `.tmp/{base}_*` ficam consistentes e os passos seguintes (02 em diante) podem rodar normalmente.
 - Edge case (trim): se marcar cortes que cobririam o vídeo inteiro, o save é recusado com erro claro; se o vídeo não tiver áudio, `atrim`/mapeamento de áudio são omitidos automaticamente.
 

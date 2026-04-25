@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: pyAudioAnalysis
+Version: 0.3.14
+Summary: Python Audio Analysis Library: Feature Extraction, Classification, Segmentation and Applications
+Home-page: https://github.com/tyiannak/pyAudioAnalysis
+Author: Theodoros Giannakopoulos
+Author-email: tyiannak@gmail.com
+License: Apache License, Version 2.0
+License-File: LICENSE.md
+Requires-Dist: matplotlib>=3.4.2
+Requires-Dist: simplejson>=3.16.0
+Requires-Dist: scipy>=1.6.3
+Requires-Dist: numpy>=1.20.3
+Requires-Dist: hmmlearn>=0.2.5
+Requires-Dist: eyeD3>=0.9.6
+Requires-Dist: pydub>=0.25.1
+Requires-Dist: scikit_learn>=0.24.2
+Requires-Dist: tqdm>=4.52.0
+Requires-Dist: plotly>=5.3.1
+Requires-Dist: pandas>=1.2.4
+Requires-Dist: imblearn
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

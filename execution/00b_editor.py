@@ -20,10 +20,10 @@ Typical flow:
   1. Run ``00_convert_source.py`` — or ``watch_input.py`` (convert only).
   2. Run this script; **trim** then **Mark trim done** — transcription (step 01)
      runs automatically unless ``EDITOR_AUTO_TRANSCRIBE=0``.
-  3. Edit the transcript → **Save** (after a short debounce, steps 02+ run
-     automatically unless ``EDITOR_AUTO_PIPELINE=0``), or use **Mark transcript
-     review done** to confirm + run immediately, or **Run 02+** in the sidebar
-     to start post-01 steps manually (always, including when auto-pipeline is off).
+  3. Edit the transcript → **Save** to persist the JSON only; when ready, **Save
+     and continue** to confirm and run 02+ (debounced if ``EDITOR_AUTO_PIPELINE``;
+     with it off, writes the review marker so **Run 02+** is allowed), or
+     **Mark transcript review done** / **Run 02+** in the sidebar as before.
 
 Usage:
   python execution/00b_editor.py                  # default port 5058
@@ -217,7 +217,7 @@ def _complete_review_and_run_pipeline(base: str, tmp_dir: str) -> None:
 
 
 def schedule_pipeline_after_transcript_save(base: str, tmp_dir: str) -> bool:
-    """Debounce: after the last Save, wait then write review marker and run 02+."""
+    """Debounce: after Save and continue, wait then write review marker and run 02+."""
     if not _editor_auto_pipeline_enabled():
         return False
     delay = _pipeline_debounce_seconds()
@@ -1492,7 +1492,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="view-welcome" class="view active card">
         <div class="welcome">
           <div class="big">Pick a file to edit</div>
-          <p>The sidebar lists files in <code>.tmp/</code>. <strong>Order:</strong> trim → <strong>Mark trim done</strong> (auto-transcribe) → edit transcript → <strong>Save</strong> (after ~3s idle, the rest of the pipeline runs; tune with <code>EDITOR_AUTO_PIPELINE_DEBOUNCE</code>) or <strong>Mark transcript review done</strong> for an immediate run. Each project title has <strong>Run 02+</strong> to start post-01 steps anytime (same as <code>run_pipeline.py --skip 00,01</code>; still respects editor gates). Set <code>EDITOR_AUTO_PIPELINE=0</code> and use <strong>Run 02+</strong> or the CLI when you want manual control. New trim clears gates until you confirm again.</p>
+          <p>The sidebar lists files in <code>.tmp/</code>. <strong>Order:</strong> trim → <strong>Mark trim done</strong> (auto-transcribe) → edit transcript → <strong>Save</strong> (writes only) or <strong>Save and continue</strong> to confirm and run 02+ (after ~3s idle when <code>EDITOR_AUTO_PIPELINE=1</code>, tune with <code>EDITOR_AUTO_PIPELINE_DEBOUNCE</code>) or <strong>Mark transcript review done</strong> + pipeline. When <code>EDITOR_AUTO_PIPELINE=0</code>, <strong>Save and continue</strong> only writes the review marker — use <strong>Run 02+</strong> in the project row. <strong>Run 02+</strong> is always available (same as <code>run_pipeline.py --skip 00,01</code>; respects editor gates). New trim clears gates until you confirm again.</p>
         </div>
       </div>
 
@@ -1578,6 +1578,7 @@ INDEX_HTML = r"""<!doctype html>
               <button id="revert-transcript" class="ghost" type="button">Reload</button>
               <span class="spacer" style="flex:1"></span>
               <button id="save-transcript" class="success" type="button">Save</button>
+              <button id="save-transcript-continue" class="primary" type="button" title="Confirm review and run 02+ (or write gate for Run 02+)">Save and continue</button>
             </div>
 
             <div class="history">
@@ -2475,9 +2476,32 @@ INDEX_HTML = r"""<!doctype html>
       const data = await r.json();
       app.transcript.dirty = false;
       setStatus("Saved");
+      const saveMsg = `Saved → ${data.path}${data.backup ? " (backup created)" : ""}`;
+      toast(saveMsg, "success");
+      refreshFiles();
+    }
+
+    async function saveTranscriptAndContinue() {
+      setStatus("Saving…");
+      const r = await fetch("/api/transcript/save-and-continue", { method: "POST" });
+      if (!r.ok) {
+        let err = "Save failed.";
+        try {
+          const j = await r.json();
+          if (j.error) err = j.error;
+        } catch (e) { /* ignore */ }
+        toast(err, "error");
+        setStatus("Error");
+        return;
+      }
+      const data = await r.json();
+      app.transcript.dirty = false;
+      setStatus("Saved");
       let saveMsg = `Saved → ${data.path}${data.backup ? " (backup created)" : ""}`;
       if (data.auto_pipeline_scheduled) {
         saveMsg += ` — pipeline in ~${data.pipeline_debounce_sec}s (watch terminal)`;
+      } else if (data.review_marker_path) {
+        saveMsg += " — review confirmed; use Run 02+ in the sidebar to start steps.";
       }
       toast(saveMsg, "success");
       refreshFiles();
@@ -2491,6 +2515,7 @@ INDEX_HTML = r"""<!doctype html>
 
     $("apply").addEventListener("click", applyReplacement);
     $("save-transcript").addEventListener("click", saveTranscript);
+    $("save-transcript-continue").addEventListener("click", saveTranscriptAndContinue);
     $("revert-transcript").addEventListener("click", reloadTranscript);
     $("word-search").addEventListener("input", renderTranscriptWords);
     $("find").addEventListener("keydown", (e) => { if (e.key === "Enter") $("replace").focus(); });
@@ -2862,13 +2887,40 @@ def _build_handler(session: Session, output_dir: str):
                 except OSError as e:
                     self._send_json(500, {"error": f"save failed: {e}"}); return
                 base = _transcript_base(session.transcript.path)
+                _cancel_pipeline_debounce_for_base(base)
+                self._send_json(200, info); return
+
+            if path == "/api/transcript/save-and-continue":
+                if session.kind != "transcript" or session.transcript is None:
+                    self._send_json(400, {"error": "no transcript open"}); return
+                try:
+                    info = session.transcript.save()
+                except OSError as e:
+                    self._send_json(500, {"error": f"save failed: {e}"}); return
+                base = _transcript_base(session.transcript.path)
                 debounce = _pipeline_debounce_seconds()
-                scheduled = schedule_pipeline_after_transcript_save(base, session.tmp_dir)
-                info = {
-                    **info,
-                    "auto_pipeline_scheduled": scheduled,
-                    "pipeline_debounce_sec": debounce if scheduled else 0.0,
-                }
+                if _editor_auto_pipeline_enabled():
+                    scheduled = schedule_pipeline_after_transcript_save(base, session.tmp_dir)
+                    info = {
+                        **info,
+                        "auto_pipeline_scheduled": scheduled,
+                        "pipeline_debounce_sec": debounce if scheduled else 0.0,
+                    }
+                else:
+                    try:
+                        marker_path = editor_gate.write_editor_review_for_base(
+                            base, session.tmp_dir
+                        )
+                    except ValueError as e:
+                        self._send_json(400, {"error": str(e)}); return
+                    except OSError as e:
+                        self._send_json(500, {"error": f"review marker failed: {e}"}); return
+                    info = {
+                        **info,
+                        "auto_pipeline_scheduled": False,
+                        "pipeline_debounce_sec": 0.0,
+                        "review_marker_path": marker_path,
+                    }
                 self._send_json(200, info); return
 
             if path == "/api/transcript/reload":

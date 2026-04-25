@@ -53,11 +53,11 @@ python execution/run_pipeline.py input/my_video.mp4
 
 ### Always-on pre-processing (recommended at session start)
 
-The watcher runs **step 00 only** when a new video lands in `input/`. Then: **trim** in `00b_editor.py` → **Mark trim done** — Whisper step 01 runs **automatically** in the background (disable with `EDITOR_AUTO_TRANSCRIBE=0`, then run `run_pipeline.py .tmp/BASE.mp4 --only 01`) → fix transcript in 00b → **Mark transcript review done** → run the rest:
+The watcher runs **step 00 only** when a new video lands in `input/`. Then: **trim** in `00b_editor.py` → **Mark trim done** — Whisper step 01 runs **automatically** in the background (disable with `EDITOR_AUTO_TRANSCRIBE=0`, then run `run_pipeline.py .tmp/BASE.mp4 --only 01`) → fix transcript in 00b → **Save and continue** (or **Mark transcript review done**) to run 02+:
 
 ```bash
 python execution/watch_input.py                   # or: python execution/run_pipeline.py --watch
-# After transcript Save (debounced) or “Mark transcript review done”, steps 02+ run in the editor by default (EDITOR_AUTO_PIPELINE=0 to disable)
+# After “Save and continue” (debounced when EDITOR_AUTO_PIPELINE=1) or “Mark transcript review done”, steps 02+ run from the editor; plain “Save” only persists the JSON
 python execution/run_pipeline.py input/BASE.mov --skip 00,01   # manual 02+ if auto-pipeline is off
 ```
 

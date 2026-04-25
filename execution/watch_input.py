@@ -183,8 +183,9 @@ def _post_step00_hint(base: str, tmp_dir: str) -> str:
         )
     if not editor_gate.is_editor_review_complete_for_base(base, tmp_dir):
         return (
-            "Transcript on disk — edit in 00b_editor (Transcript mode), then Save or "
-            "“Mark transcript review done” (or rely on EDITOR_AUTO_PIPELINE)."
+            "Transcript on disk — edit in 00b_editor (Transcript mode), then "
+            "“Save and continue” or “Mark transcript review done” to confirm; "
+            "plain “Save” only writes the file."
         )
     return (
         "Transcript review already confirmed — run remaining steps with "
