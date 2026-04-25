@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import env_paths
 from video_encoding import build_lossless_x264_args
 from transcript_remap import remap_transcript_to_keeps, write_transcript
 
@@ -112,7 +113,9 @@ def _publish_fillers_output(
     return canonical
 
 
-def remove_fillers(video_path: str, tmp_dir: str = ".tmp") -> str:
+def remove_fillers(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     os.makedirs(tmp_dir, exist_ok=True)
     # Prefer retakes-removed video when step 02 already ran (legacy / --step order).

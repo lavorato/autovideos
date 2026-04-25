@@ -62,10 +62,11 @@ except ImportError:
     pass
 
 import editor_gate  # noqa: E402
+import env_paths  # noqa: E402
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-DEFAULT_INPUT_DIR = "input"
-DEFAULT_TMP_DIR = ".tmp"
+DEFAULT_INPUT_DIR = env_paths.input_dir()
+DEFAULT_TMP_DIR = env_paths.tmp_dir()
 DEFAULT_INTERVAL = 3.0
 STABLE_POLLS_REQUIRED = 2  # same (size, mtime) across this many polls = ready
 
@@ -312,7 +313,10 @@ class Watcher:
         initial = list(_iter_input_videos(self.input_dir))
         self._seed_done_from_disk(initial)
 
-        log_info(f"Currently {len(initial)} file(s) in input/. Waiting for changes…")
+        log_info(
+            f"Currently {len(initial)} file(s) in {DEFAULT_INPUT_DIR}/. "
+            f"Waiting for changes…"
+        )
 
         processed_any = False
         while not self._stop_requested:

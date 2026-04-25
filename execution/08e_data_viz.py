@@ -45,6 +45,7 @@ from openrouter_client import (
     has_openrouter_api_key,
     parse_models_from_env,
 )
+import env_paths
 from video_encoding import (
     build_fast_hq_x264_args,
     first_existing_nonempty_video,
@@ -92,7 +93,7 @@ def _pick_input_source_path(candidates: list[str], input_abs: str) -> str | None
 
 def _resolve_original_source_under_input(video_path: str, base: str) -> str | None:
     """Absolute path to the ingest file under input/, if we can find it."""
-    input_abs = os.path.abspath("input")
+    input_abs = env_paths.input_dir()
     if not os.path.isdir(input_abs):
         return None
     abs_vp = os.path.abspath(video_path)
@@ -832,11 +833,13 @@ def _write_sidecar(path: str, moments: list[Moment], model: str | None) -> None:
 
 # --- Public entry point ----------------------------------------------------
 
-def apply_data_viz(video_path: str, tmp_dir: str = ".tmp") -> str:
+def apply_data_viz(video_path: str, tmp_dir: str | None = None) -> str:
     """
     Orchestrate the 08e step. Safe no-op return ("") when there's nothing
     to overlay — run_pipeline.py tolerates empty returns.
     """
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     sidecar_path = os.path.join(tmp_dir, f"{base}_dataviz_moments.json")
     output_path = os.path.join(tmp_dir, f"{base}_dataviz.mp4")

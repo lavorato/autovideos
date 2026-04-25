@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 from moviepy import VideoFileClip
 import subprocess
+import env_paths
 from video_encoding import build_moviepy_lossless_params
 
 
@@ -113,7 +114,9 @@ def generate_zoom_pan_filter(positions: list, width: int, height: int,
     return effects
 
 
-def apply_zoom_pan(video_path: str, tmp_dir: str = ".tmp") -> str:
+def apply_zoom_pan(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     input_video = os.path.join(tmp_dir, f"{base}_color.mp4")
     if not os.path.exists(input_video):

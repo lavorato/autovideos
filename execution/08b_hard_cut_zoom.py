@@ -25,6 +25,7 @@ import cv2
 import subprocess
 from editor_gate import stem_for_editor_gate
 from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
+import env_paths
 from video_encoding import build_fast_pipeline_encode_args
 
 # --- Config ---
@@ -231,12 +232,14 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
-def _load_transcript_segments(video_path: str, tmp_dir: str = ".tmp") -> list:
+def _load_transcript_segments(video_path: str, tmp_dir: str | None = None) -> list:
     """Load segments from the Whisper transcript if present.
 
     ``run_pipeline`` passes the current intermediate ``.mp4`` (e.g. …_studio.mp4);
     transcripts stay keyed by the trim/ingest stem (e.g. ``IMG_17922_transcript.json``).
     """
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     raw_stem = os.path.splitext(os.path.basename(video_path))[0]
     base = stem_for_editor_gate(raw_stem)
     transcript_path = os.path.join(tmp_dir, f"{base}_transcript.json")
@@ -436,7 +439,9 @@ def _segments_from_zoom_moments(moments: list, duration: float) -> list:
     return result
 
 
-def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
+def apply_hard_cut_zoom(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
 
     input_video = os.path.join(tmp_dir, f"{base}_multicam.mp4")

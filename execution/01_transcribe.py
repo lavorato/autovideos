@@ -15,6 +15,8 @@ import subprocess
 import torch
 import whisperx
 
+import env_paths
+
 
 def _probe_duration_seconds(video_path: str) -> float | None:
     """Return container duration in seconds, or None if ffprobe fails."""
@@ -175,7 +177,9 @@ def _extract_words(aligned_result: dict) -> list:
     return words
 
 
-def transcribe(video_path: str, output_dir: str = ".tmp") -> str:
+def transcribe(video_path: str, output_dir: str | None = None) -> str:
+    if output_dir is None:
+        output_dir = env_paths.tmp_dir()
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(video_path))[0]
     output_path = os.path.join(output_dir, f"{base}_transcript.json")

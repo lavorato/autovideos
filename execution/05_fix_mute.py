@@ -10,6 +10,8 @@ import struct
 import wave
 import tempfile
 
+import env_paths
+
 
 def detect_silent_gaps(video_path: str, silence_threshold: float = -40,
                        min_duration: float = 0.5) -> list:
@@ -48,7 +50,9 @@ def detect_silent_gaps(video_path: str, silence_threshold: float = -40,
     return gaps
 
 
-def fix_mute(video_path: str, tmp_dir: str = ".tmp") -> str:
+def fix_mute(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     input_video = os.path.join(tmp_dir, f"{base}_studio.mp4")
     if not os.path.exists(input_video):

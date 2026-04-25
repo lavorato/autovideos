@@ -8,6 +8,7 @@ import os
 import random
 import subprocess
 
+import env_paths
 from video_encoding import (
     build_color_preserving_composite_encode_args,
     first_existing_nonempty_video,
@@ -16,13 +17,14 @@ from video_encoding import (
 # --- Config ---
 MUSIC_VOLUME = 0.20        # 0.0 to 1.0 — how loud the music is relative to original audio
 FADE_OUT_DURATION = 0    # seconds of fade out at the end
-MUSIC_DIR = "music"
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac", ".opus"}
 
 
-def pick_random_track(music_dir: str = MUSIC_DIR) -> str | None:
-    """Pick a random audio file from the music directory."""
+def pick_random_track(music_dir: str | None = None) -> str | None:
+    """Pick a random audio file from the music directory (VIDEOS_MUSIC_DIR)."""
+    if music_dir is None:
+        music_dir = env_paths.music_dir()
     if not os.path.isdir(music_dir):
         return None
     tracks = [
@@ -45,8 +47,13 @@ def get_duration(path: str) -> float:
     return float(probe.stdout.strip())
 
 
-def add_background_music(video_path: str, tmp_dir: str = ".tmp",
-                          output_dir: str = "output") -> str:
+def add_background_music(
+    video_path: str, tmp_dir: str | None = None, output_dir: str | None = None
+) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
+    if output_dir is None:
+        output_dir = env_paths.output_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
 
     # Resolve input: prefer final, then intermediates (skip empty files)
@@ -73,7 +80,7 @@ def add_background_music(video_path: str, tmp_dir: str = ".tmp",
     # Pick a track
     track = pick_random_track()
     if not track:
-        print(f"[10] No music files found in {MUSIC_DIR}/, skipping.")
+        print(f"[10] No music files found in {env_paths.music_dir()}/, skipping.")
         return ""
 
     print(f"[10] Selected track: {os.path.basename(track)}")

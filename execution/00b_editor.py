@@ -63,6 +63,7 @@ except ImportError:
     pass
 
 import editor_gate  # noqa: E402
+import env_paths  # noqa: E402
 from video_encoding import build_lossless_x264_args  # noqa: E402
 
 
@@ -661,8 +662,10 @@ def _transcript_word_count(path: str) -> int:
     return len(data.get("words") or [])
 
 
-def list_editable_files(tmp_dir: str = ".tmp") -> list[dict[str, Any]]:
+def list_editable_files(tmp_dir: str | None = None) -> list[dict[str, Any]]:
     """List all videos + transcripts under ``tmp_dir`` that the editor can open."""
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     if not os.path.isdir(tmp_dir):
         return []
 
@@ -705,8 +708,10 @@ def list_editable_files(tmp_dir: str = ".tmp") -> list[dict[str, Any]]:
     return out
 
 
-def list_finalized_videos(output_dir: str = "output") -> list[dict[str, Any]]:
+def list_finalized_videos(output_dir: str | None = None) -> list[dict[str, Any]]:
     """List ``{output_dir}/*_final.mp4`` files produced by the pipeline."""
+    if output_dir is None:
+        output_dir = env_paths.output_dir()
     root = os.path.abspath(output_dir)
     if not os.path.isdir(root):
         return []
@@ -866,8 +871,8 @@ class TranscriptEditor:
 class Session:
     """Thread-safe holder for the currently-open editor."""
 
-    def __init__(self, tmp_dir: str = ".tmp") -> None:
-        self.tmp_dir = tmp_dir
+    def __init__(self, tmp_dir: str | None = None) -> None:
+        self.tmp_dir = tmp_dir if tmp_dir is not None else env_paths.tmp_dir()
         self._lock = threading.Lock()
         self.kind: str | None = None
         self.video: VideoEditor | None = None
@@ -2932,9 +2937,13 @@ def serve(
     initial_path: str | None = None,
     port: int = 5058,
     open_browser: bool = True,
-    tmp_dir: str = ".tmp",
-    output_dir: str = "output",
+    tmp_dir: str | None = None,
+    output_dir: str | None = None,
 ) -> None:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
+    if output_dir is None:
+        output_dir = env_paths.output_dir()
     session = Session(tmp_dir=tmp_dir)
     if initial_path:
         try:
@@ -2981,11 +2990,15 @@ def main() -> int:
     )
     ap.add_argument("--port", type=int, default=5058, help="Local port (default: 5058).")
     ap.add_argument("--no-browser", action="store_true", help="Don't auto-open the browser.")
-    ap.add_argument("--tmp-dir", default=".tmp", help="Directory to browse (default: .tmp).")
+    ap.add_argument(
+        "--tmp-dir",
+        default=env_paths.tmp_dir(),
+        help="Directory to browse (default: VIDEOS_TMP_DIR or .tmp).",
+    )
     ap.add_argument(
         "--output-dir",
-        default="output",
-        help="Directory for finalized *_final.mp4 listings and playback (default: output).",
+        default=env_paths.output_dir(),
+        help="Directory for finalized *_final.mp4 listings (default: VIDEOS_OUTPUT_DIR or output).",
     )
     g_mark = ap.add_mutually_exclusive_group()
     g_mark.add_argument(

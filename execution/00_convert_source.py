@@ -47,6 +47,7 @@ import shutil
 import sys
 import subprocess
 
+import env_paths
 from video_encoding import build_fast_hq_x264_args
 
 
@@ -84,7 +85,9 @@ def _probe_dimensions(video_path: str) -> tuple[int, int]:
     return (int(streams[0].get("width") or 0), int(streams[0].get("height") or 0))
 
 
-def convert_source(video_path: str, tmp_dir: str = ".tmp") -> str:
+def convert_source(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     ext = os.path.splitext(video_path)[1].lower()
     base = os.path.splitext(os.path.basename(video_path))[0]
     os.makedirs(tmp_dir, exist_ok=True)

@@ -36,6 +36,7 @@ import math
 import platform
 import subprocess
 
+import env_paths
 from video_encoding import build_fast_pipeline_encode_args, first_existing_nonempty_video
 
 
@@ -53,8 +54,9 @@ def find_cam02(video_path: str) -> str | None:
     search_dirs: list[str] = []
     src_dir = os.path.dirname(os.path.abspath(video_path)) or "."
     search_dirs.append(src_dir)
-    if os.path.abspath("input") != os.path.abspath(src_dir):
-        search_dirs.append(os.path.abspath("input"))
+    input_root = env_paths.input_dir()
+    if os.path.abspath(input_root) != os.path.abspath(src_dir):
+        search_dirs.append(input_root)
 
     seen: set[str] = set()
     for d in search_dirs:
@@ -109,7 +111,9 @@ def build_segment_boundaries(duration: float, interval: float = CUT_INTERVAL) ->
     return boundaries
 
 
-def apply_multicam(video_path: str, tmp_dir: str = ".tmp") -> str:
+def apply_multicam(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
 
     cam02 = find_cam02(video_path)

@@ -13,6 +13,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+import env_paths
+
 
 def video_basename(video_path: str) -> str:
     return os.path.splitext(os.path.basename(video_path))[0]
@@ -58,12 +60,17 @@ def stem_for_editor_gate(stem: str) -> str:
     return stem
 
 
-def editor_review_path(video_path: str, tmp_dir: str = ".tmp") -> str:
+def _resolve_tmp_dir(tmp_dir: str | None) -> str:
+    return tmp_dir if tmp_dir is not None else env_paths.tmp_dir()
+
+
+def editor_review_path(video_path: str, tmp_dir: str | None = None) -> str:
     return editor_review_path_for_base(stem_for_editor_gate(video_basename(video_path)), tmp_dir)
 
 
-def editor_review_path_for_base(base: str, tmp_dir: str = ".tmp") -> str:
-    return os.path.join(tmp_dir, f"{base}_editor_review.json")
+def editor_review_path_for_base(base: str, tmp_dir: str | None = None) -> str:
+    d = _resolve_tmp_dir(tmp_dir)
+    return os.path.join(d, f"{base}_editor_review.json")
 
 
 def _load_marker(base: str, tmp_dir: str) -> dict[str, Any] | None:
@@ -82,7 +89,8 @@ def _is_legacy_both_done(data: dict[str, Any]) -> bool:
     return bool(data.get("confirmed_at")) and "trim_confirmed_at" not in data and "review_confirmed_at" not in data
 
 
-def is_trim_complete_for_base(base: str, tmp_dir: str = ".tmp") -> bool:
+def is_trim_complete_for_base(base: str, tmp_dir: str | None = None) -> bool:
+    tmp_dir = _resolve_tmp_dir(tmp_dir)
     data = _load_marker(base, tmp_dir)
     if not data:
         return False
@@ -91,11 +99,12 @@ def is_trim_complete_for_base(base: str, tmp_dir: str = ".tmp") -> bool:
     return _is_legacy_both_done(data)
 
 
-def is_trim_complete(video_path: str, tmp_dir: str = ".tmp") -> bool:
+def is_trim_complete(video_path: str, tmp_dir: str | None = None) -> bool:
     return is_trim_complete_for_base(stem_for_editor_gate(video_basename(video_path)), tmp_dir)
 
 
-def is_editor_review_complete_for_base(base: str, tmp_dir: str = ".tmp") -> bool:
+def is_editor_review_complete_for_base(base: str, tmp_dir: str | None = None) -> bool:
+    tmp_dir = _resolve_tmp_dir(tmp_dir)
     data = _load_marker(base, tmp_dir)
     if not data:
         return False
@@ -104,7 +113,7 @@ def is_editor_review_complete_for_base(base: str, tmp_dir: str = ".tmp") -> bool
     return _is_legacy_both_done(data)
 
 
-def is_editor_review_complete(video_path: str, tmp_dir: str = ".tmp") -> bool:
+def is_editor_review_complete(video_path: str, tmp_dir: str | None = None) -> bool:
     return is_editor_review_complete_for_base(
         stem_for_editor_gate(video_basename(video_path)), tmp_dir
     )
@@ -138,7 +147,7 @@ def tmp_base_has_assets(tmp_dir: str, base: str) -> bool:
     return tmp_base_has_video(tmp_dir, base) or tmp_base_has_transcript(tmp_dir, base)
 
 
-def delete_marker_for_base(base: str, tmp_dir: str = ".tmp") -> None:
+def delete_marker_for_base(base: str, tmp_dir: str | None = None) -> None:
     p = editor_review_path_for_base(base, tmp_dir)
     try:
         os.remove(p)
@@ -146,12 +155,13 @@ def delete_marker_for_base(base: str, tmp_dir: str = ".tmp") -> None:
         pass
 
 
-def reset_gates_after_video_trim(base: str, tmp_dir: str = ".tmp") -> None:
+def reset_gates_after_video_trim(base: str, tmp_dir: str | None = None) -> None:
     """After saving a new trim, timestamps/transcript review are invalid — clear marker."""
     delete_marker_for_base(base, tmp_dir)
 
 
-def write_trim_confirm_for_base(base: str, tmp_dir: str = ".tmp") -> str:
+def write_trim_confirm_for_base(base: str, tmp_dir: str | None = None) -> str:
+    tmp_dir = _resolve_tmp_dir(tmp_dir)
     if not tmp_base_has_video(tmp_dir, base):
         raise ValueError(f"No .mp4 in {tmp_dir!r} for base {base!r}")
     out = editor_review_path_for_base(base, tmp_dir)
@@ -163,7 +173,8 @@ def write_trim_confirm_for_base(base: str, tmp_dir: str = ".tmp") -> str:
     return out
 
 
-def write_editor_review_for_base(base: str, tmp_dir: str = ".tmp") -> str:
+def write_editor_review_for_base(base: str, tmp_dir: str | None = None) -> str:
+    tmp_dir = _resolve_tmp_dir(tmp_dir)
     if not tmp_base_has_transcript(tmp_dir, base):
         raise ValueError(
             f"No transcript at {tmp_dir}/{base}_transcript.json — run step 01 after trim first."
@@ -191,11 +202,11 @@ def write_editor_review_for_base(base: str, tmp_dir: str = ".tmp") -> str:
     return out
 
 
-def write_editor_review_complete(video_path: str, tmp_dir: str = ".tmp") -> str:
+def write_editor_review_complete(video_path: str, tmp_dir: str | None = None) -> str:
     return write_editor_review_for_base(stem_for_editor_gate(video_basename(video_path)), tmp_dir)
 
 
-def write_trim_confirm_complete(video_path: str, tmp_dir: str = ".tmp") -> str:
+def write_trim_confirm_complete(video_path: str, tmp_dir: str | None = None) -> str:
     return write_trim_confirm_for_base(stem_for_editor_gate(video_basename(video_path)), tmp_dir)
 
 

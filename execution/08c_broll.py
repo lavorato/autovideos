@@ -32,6 +32,7 @@ from video_encoding import (
     first_existing_nonempty_video,
     source_color_normalize_filter,
 )
+import env_paths
 from editor_gate import stem_for_editor_gate
 
 # --- Config ---
@@ -172,7 +173,7 @@ def resolve_broll_assets_directory(video_path: str) -> tuple[str | None, str]:
     ``input/{base}/`` so we do not scan all of ``input/``.
     """
     base = _ingest_stem_from_video_path(video_path)
-    input_abs = os.path.abspath("input")
+    input_abs = env_paths.input_dir()
     if not os.path.isdir(input_abs):
         return None, base
 
@@ -905,7 +906,9 @@ def apply_broll_ffmpeg(placements: list, main_video: str,
     return output_path
 
 
-def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
+def apply_broll(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = _ingest_stem_from_video_path(video_path)
 
     # Find assets

@@ -3,4 +3,7 @@ python execution/run_pipeline.py --dry-run --step 08b
 python execution/run_pipeline.py --dry-run --only 01,09
 
 python execution/run_pipeline.py --watch
+
 python execution/run_pipeline.py input/IMG_17922.mp4 --skip 00,01
+
+python execution/00b_editor.py

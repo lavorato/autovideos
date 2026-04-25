@@ -6,8 +6,12 @@ import sys
 import os
 import subprocess
 
+import env_paths
 
-def apply_studio_sound(video_path: str, tmp_dir: str = ".tmp") -> str:
+
+def apply_studio_sound(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     # Prefer the voice-isolated track from Step 3b if available, so EQ/compression
     # operate on a clean vocals stem instead of noisy raw audio. Fall back through

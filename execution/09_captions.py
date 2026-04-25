@@ -22,6 +22,7 @@ import captacity
 from captacity import segment_parser
 from moviepy import CompositeVideoClip
 
+import env_paths
 from editor_gate import stem_for_editor_gate
 from video_encoding import (
     build_color_preserving_composite_encode_args,
@@ -403,7 +404,13 @@ def _render_with_captacity(
         )
 
 
-def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "output") -> str:
+def add_captions(
+    video_path: str, tmp_dir: str | None = None, output_dir: str | None = None
+) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
+    if output_dir is None:
+        output_dir = env_paths.output_dir()
     # run_pipeline swaps video_path to each step's output (.tmp/{stem}_dataviz.mp4, …).
     # Transcripts and intermediates are keyed by the ingest stem (post-trim), e.g.
     # .tmp/IMG_17922_transcript.json — not …_dataviz_transcript.json.
@@ -503,12 +510,14 @@ def add_captions(video_path: str, tmp_dir: str = ".tmp", output_dir: str = "outp
     return output_path
 
 
-def _build_test_video(tmp_dir: str = ".tmp", duration: float = 5.0) -> str:
+def _build_test_video(tmp_dir: str | None = None, duration: float = 5.0) -> str:
     """
     Generate a 5-second 1080x1920 dummy video (dark gradient background + silent
     audio) and a matching fake word-level transcript so we can preview the
     caption style without running the full pipeline.
     """
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     os.makedirs(tmp_dir, exist_ok=True)
     base = "captions_test"
     video_path = os.path.join(tmp_dir, f"{base}.mp4")
@@ -559,8 +568,12 @@ def _build_test_video(tmp_dir: str = ".tmp", duration: float = 5.0) -> str:
     return video_path
 
 
-def run_test(tmp_dir: str = ".tmp", output_dir: str = "output") -> str:
+def run_test(tmp_dir: str | None = None, output_dir: str | None = None) -> str:
     """Preview current caption style against a 5s dummy video."""
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
+    if output_dir is None:
+        output_dir = env_paths.output_dir()
     video_path = _build_test_video(tmp_dir=tmp_dir)
     return add_captions(video_path, tmp_dir=tmp_dir, output_dir=output_dir)
 

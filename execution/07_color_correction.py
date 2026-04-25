@@ -6,8 +6,12 @@ import sys
 import os
 import subprocess
 
+import env_paths
 
-def color_correct(video_path: str, tmp_dir: str = ".tmp") -> str:
+
+def color_correct(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     input_video = os.path.join(tmp_dir, f"{base}_fixed_audio.mp4")
     if not os.path.exists(input_video):

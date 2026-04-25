@@ -7,11 +7,14 @@ import json
 import os
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector, AdaptiveDetector
+import env_paths
 from video_encoding import build_lossless_x264_args
 
 
-def split_scenes(video_path: str, tmp_dir: str = ".tmp",
+def split_scenes(video_path: str, tmp_dir: str | None = None,
                  threshold: float = 27.0, split_files: bool = False) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     input_video = os.path.join(tmp_dir, f"{base}_fixed_audio.mp4")
     if not os.path.exists(input_video):

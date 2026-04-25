@@ -7,6 +7,7 @@ Usage:
   python execution/run_pipeline.py input/video.mp4 --step 08b    # one video, one step
   python execution/run_pipeline.py --step 09                     # all videos, one step
   python execution/run_pipeline.py --skip 08b,09                 # skip specific steps
+  # --skip 00: if .tmp/STEM.mp4 exists (from 00b), it is used as source — not raw input/STEM.mp4
   python execution/run_pipeline.py --only 01,08b,09              # run only these steps
   python execution/run_pipeline.py --enable 07                   # permanently enable step(s)
   python execution/run_pipeline.py --disable 08_zoom_pan         # permanently disable step(s)
@@ -43,6 +44,7 @@ except ImportError:
 from importlib import import_module
 
 import editor_gate
+import env_paths
 
 # All steps in pipeline order. "enabled" is the default state.
 ALL_STEPS = [
@@ -70,24 +72,32 @@ TRANSCRIBE_GATED_STEP_IDS = editor_gate.TRANSCRIBE_GATE_STEP_IDS
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "pipeline_config.json")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs", "pipeline")
-STEP_OUTPUT_PATTERNS = {
-    "01": [".tmp/{base}_transcript.json"],
-    "02": [".tmp/{base}_no_retakes.mp4"],
-    "03": [".tmp/{base}_no_fillers.mp4"],
-    "03b": [".tmp/{base}_voice.mp4"],
-    "04": [".tmp/{base}_studio.mp4"],
-    "05": [".tmp/{base}_fixed_audio.mp4"],
-    "06": [".tmp/{base}_scenes.json"],
-    "07": [".tmp/{base}_color.mp4"],
-    "08": [".tmp/{base}_effects.mp4"],
-    "08b": [".tmp/{base}_hardcut.mp4"],
-    "08c": [".tmp/{base}_broll.mp4"],
-    "08d": [".tmp/{base}_fx.mp4"],
-    "08e": [".tmp/{base}_dataviz.mp4"],
-    "09": ["output/{base}_final.mp4"],
-    "10": ["output/{base}_final.mp4"],
-}
+LOGS_DIR = env_paths.logs_pipeline_dir()
+
+
+def step_output_patterns() -> dict:
+    """Expected artifact paths per step id (``{base}`` = video stem)."""
+    t = env_paths.tmp_dir()
+    o = env_paths.output_dir()
+    return {
+        "00": [os.path.join(t, "{base}.mp4")],
+        "01": [os.path.join(t, "{base}_transcript.json")],
+        "02": [os.path.join(t, "{base}_no_retakes.mp4")],
+        "03": [os.path.join(t, "{base}_no_fillers.mp4")],
+        "03b": [os.path.join(t, "{base}_voice.mp4")],
+        "04": [os.path.join(t, "{base}_studio.mp4")],
+        "05": [os.path.join(t, "{base}_fixed_audio.mp4")],
+        "06": [os.path.join(t, "{base}_scenes.json")],
+        "07": [os.path.join(t, "{base}_color.mp4")],
+        "08": [os.path.join(t, "{base}_effects.mp4")],
+        "08a": [os.path.join(t, "{base}_multicam.mp4")],
+        "08b": [os.path.join(t, "{base}_hardcut.mp4")],
+        "08c": [os.path.join(t, "{base}_broll.mp4")],
+        "08d": [os.path.join(t, "{base}_fx.mp4")],
+        "08e": [os.path.join(t, "{base}_dataviz.mp4")],
+        "09": [os.path.join(o, "{base}_final.mp4")],
+        "10": [os.path.join(o, "{base}_final.mp4")],
+    }
 
 
 class TeeStream:
@@ -207,8 +217,10 @@ def resolve_step_list(csv: str, steps: list) -> list:
 
 # ── Cleanup ───────────────────────────────────────────────────
 
-def clean_tmp(video_path: str, tmp_dir: str = ".tmp"):
-    """Remove all intermediate files for a specific video from .tmp/."""
+def clean_tmp(video_path: str, tmp_dir: str | None = None):
+    """Remove all intermediate files for a specific video from the tmp folder."""
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
     if not os.path.isdir(tmp_dir):
         return
@@ -225,7 +237,9 @@ def clean_tmp(video_path: str, tmp_dir: str = ".tmp"):
 
 # ── Execution ─────────────────────────────────────────────────
 
-def find_videos(input_dir: str = "input") -> list:
+def find_videos(input_dir: str | None = None) -> list:
+    if input_dir is None:
+        input_dir = env_paths.input_dir()
     videos = []
     for f in sorted(os.listdir(input_dir)):
         if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS:
@@ -255,7 +269,7 @@ def run_step(step: dict, video_path: str):
 def expected_outputs_for_step(step: dict, video_path: str) -> list:
     """Resolve expected output file paths for a step."""
     base = os.path.splitext(os.path.basename(video_path))[0]
-    patterns = STEP_OUTPUT_PATTERNS.get(step["id"], [])
+    patterns = step_output_patterns().get(step["id"], [])
     return [os.path.abspath(p.format(base=base)) for p in patterns]
 
 
@@ -290,6 +304,35 @@ def verify_step_output(step: dict, video_path: str) -> bool:
     return True
 
 
+def _resolve_prepared_working_path(
+    video_path: str,
+    active_step_ids: set,
+    tmp_dir: str,
+) -> str:
+    """If step 00 is not in this run, use ``.tmp/{base}.mp4`` when it exists (trim/convert from
+    00b) instead of a path under ``input/``. Without this, ``--skip 00,01`` on ``input/…`` still
+    fed the full raw file into 02+ while the transcript and gates referred to the trimmed version."""
+    if "00" in active_step_ids:
+        return video_path
+    base = editor_gate.resolve_base_from_cli_arg(video_path)
+    canonical = os.path.abspath(os.path.join(tmp_dir, f"{base}.mp4"))
+    current = os.path.abspath(video_path)
+    if current == canonical:
+        return video_path
+    if editor_gate.tmp_base_has_video(tmp_dir, base):
+        print(
+            f"  Step 00 skipped: using prepared source from .tmp/ (trim + convert as in 00b):"
+            f"\n    {canonical}"
+        )
+        return canonical
+    print(
+        f"  WARNING: Step 00 skipped and no non-empty {canonical!r}.\n"
+        f"  Will use {current!r} for video; it may not match the transcript if that file is the"
+        f" unprocessed source. Re-run 00 or save the trim in 00b to create {os.path.basename(canonical)}."
+    )
+    return video_path
+
+
 def process_video(
     video_path: str,
     steps: list,
@@ -297,15 +340,29 @@ def process_video(
     verify_outputs: bool = False,
     fail_fast: bool = False,
     skip_editor_gate: bool = False,
-    tmp_dir: str = ".tmp",
+    tmp_dir: str | None = None,
 ) -> bool:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     print(f"\n{'='*60}")
     print(f"  Processing: {video_path}")
     print(f"  Steps: {len(steps)} active")
     print(f"{'='*60}")
 
     if do_clean:
-        clean_tmp(video_path)
+        clean_tmp(video_path, tmp_dir=tmp_dir)
+
+    active_ids = {s["id"] for s in steps}
+    video_path = _resolve_prepared_working_path(video_path, active_ids, tmp_dir)
+    if "01" not in active_ids and active_ids - {"00", "01"}:
+        b = editor_gate.stem_for_editor_gate(editor_gate.resolve_base_from_cli_arg(video_path))
+        if not editor_gate.tmp_base_has_transcript(tmp_dir, b):
+            print(
+                f"  ERROR: Step 01 skipped but no transcript at "
+                f"{os.path.join(tmp_dir, f'{b}_transcript.json')!r}.\n"
+                f"  Run 01 or finish transcribe in 00b before post-01 steps."
+            )
+            return False
 
     start_total = time.time()
     all_ok = True
@@ -518,7 +575,7 @@ def main():
     else:
         videos = find_videos()
         if not videos:
-            print("No videos found in input/")
+            print(f"No videos found in {env_paths.input_dir()}/")
             sys.exit(1)
 
         print(f"Found {len(videos)} video(s):")
@@ -546,7 +603,7 @@ def main():
                 print(f"  - {video}")
             sys.exit(1)
 
-        print("\nAll done! Check output/ for final videos.")
+        print(f"\nAll done! Check {env_paths.output_dir()}/ for final videos.")
 
 
 def run_with_file_logging():

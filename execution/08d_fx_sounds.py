@@ -14,7 +14,7 @@ Tunables (env vars):
   - FX_VOLUME            (default 0.6)  — gain applied to each FX before mixing
   - FX_MAX_DURATION      (default 2.5)  — seconds; longer FX are trimmed to this
   - FX_DISABLE=1                        — skip the step entirely
-  - FX_DIR               (default fxs/) — folder to pick FX files from
+  - VIDEOS_FX_DIR / FX_DIR — folder to pick FX files from (default: fxs/)
 """
 import sys
 import os
@@ -22,10 +22,8 @@ import json
 import random
 import subprocess
 
+import env_paths
 from video_encoding import first_existing_nonempty_video
-
-
-FX_DIR = os.environ.get("FX_DIR", "fxs")
 FX_VOLUME = float(os.environ.get("FX_VOLUME", "0.6"))
 FX_MAX_DURATION = float(os.environ.get("FX_MAX_DURATION", "2.5"))
 FX_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".ogg", ".flac"}
@@ -77,7 +75,9 @@ def _probe_channel_layout(path: str) -> str:
     return "stereo"
 
 
-def _list_fx_files(fx_dir: str = FX_DIR) -> list[str]:
+def _list_fx_files(fx_dir: str | None = None) -> list[str]:
+    if fx_dir is None:
+        fx_dir = env_paths.fx_dir()
     if not os.path.isdir(fx_dir):
         return []
     return [
@@ -161,7 +161,10 @@ def _passthrough(input_video: str, output_path: str) -> str:
     return output_path
 
 
-def add_fx_sounds(video_path: str, tmp_dir: str = ".tmp") -> str:
+def add_fx_sounds(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
+    fx_root = env_paths.fx_dir()
     base = os.path.splitext(os.path.basename(video_path))[0]
 
     # Prefer the latest available intermediate so captions see a single,
@@ -196,13 +199,13 @@ def add_fx_sounds(video_path: str, tmp_dir: str = ".tmp") -> str:
 
     fx_files = _list_fx_files()
     if not fx_files:
-        print(f"[08d] No FX files found in '{FX_DIR}/'; passing audio through.")
+        print(f"[08d] No FX files found in '{fx_root}/'; passing audio through.")
         return _passthrough(input_video, output_path)
 
     picks = _pick_fx_cycle(fx_files, len(moments))
     assignments = list(zip(moments, picks))
 
-    print(f"[08d] Overlaying {len(assignments)} FX sound(s) from '{FX_DIR}/'")
+    print(f"[08d] Overlaying {len(assignments)} FX sound(s) from '{fx_root}/'")
     for moment, fx in assignments:
         reason = f" — {moment['reason']}" if moment.get("reason") else ""
         print(f"  {moment['start']:6.2f}s  ←  {os.path.basename(fx)}{reason}")

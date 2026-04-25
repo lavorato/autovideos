@@ -30,6 +30,8 @@ import shutil
 import subprocess
 import tempfile
 
+import env_paths
+
 
 def _pick_device() -> str:
     override = os.getenv("VOICE_ISOLATION_DEVICE", "").strip().lower()
@@ -116,7 +118,9 @@ def _run_demucs(input_wav: str, out_dir: str, model: str, device: str, shifts: i
     return vocals_path
 
 
-def isolate_voice(video_path: str, tmp_dir: str = ".tmp") -> str:
+def isolate_voice(video_path: str, tmp_dir: str | None = None) -> str:
+    if tmp_dir is None:
+        tmp_dir = env_paths.tmp_dir()
     os.makedirs(tmp_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(video_path))[0]
 
