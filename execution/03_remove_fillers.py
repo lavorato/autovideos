@@ -11,10 +11,14 @@ from video_encoding import build_lossless_x264_args
 from transcript_remap import remap_transcript_to_keeps, write_transcript
 
 # Filler words to detect (Portuguese + English)
+# FILLER_WORDS = {
+#     "éh", "eh", "ah", "uhm", "um", "hm", "ahn", "uh",
+#     "tipo", "né", "então", "assim", "basicamente", "literalmente",
+#     "like", "you know", "basically", "actually", "literally", "so",
+# }
+
 FILLER_WORDS = {
-    "éh", "eh", "ah", "uhm", "um", "hm", "ahn", "uh",
-    "tipo", "né", "então", "assim", "basicamente", "literalmente",
-    "like", "you know", "basically", "actually", "literally", "so",
+    "éh", "eh", "ah", "uhm", "um", "hm", "ahn", "uh", "né"
 }
 
 MIN_PAUSE_KEEP = 0.6   # seconds - keep pauses shorter than this

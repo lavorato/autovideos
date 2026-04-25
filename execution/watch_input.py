@@ -61,6 +61,7 @@ try:
 except ImportError:
     pass
 
+import editor_gate  # noqa: E402
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 DEFAULT_INPUT_DIR = "input"
@@ -166,6 +167,30 @@ def _already_prepared(video_path: str, tmp_dir: str) -> bool:
         return False
 
 
+def _post_step00_hint(base: str, tmp_dir: str) -> str:
+    """Next-step line for logs; aligned with 00b_editor gates (not always 'trim')."""
+    if not editor_gate.is_trim_complete_for_base(base, tmp_dir):
+        return (
+            "Ready to trim in 00b_editor — then “Mark trim done” "
+            "(auto-transcribe unless EDITOR_AUTO_TRANSCRIBE=0). "
+            "Or run_pipeline --skip 00,01 manually after gates."
+        )
+    if not editor_gate.tmp_base_has_transcript(tmp_dir, base):
+        return (
+            "Trim already marked done — transcribe (step 01) should run from 00b; "
+            "if not, run it manually. Then edit transcript in 00b."
+        )
+    if not editor_gate.is_editor_review_complete_for_base(base, tmp_dir):
+        return (
+            "Transcript on disk — edit in 00b_editor (Transcript mode), then Save or "
+            "“Mark transcript review done” (or rely on EDITOR_AUTO_PIPELINE)."
+        )
+    return (
+        "Transcript review already confirmed — run remaining steps with "
+        "run_pipeline.py --skip 00,01 if needed."
+    )
+
+
 # ── Processing ─────────────────────────────────────────────────
 
 def _run_step_00(video_path: str, tmp_dir: str) -> str:
@@ -194,9 +219,7 @@ def process_candidate(cand: Candidate, tmp_dir: str) -> bool:
         log_info(f"  step 00 ok in {t1 - t0:.1f}s — source passed through")
 
     log_ok(
-        f"✓ {base} ready to trim ({t1 - t0:.1f}s). "
-        f"00b_editor: Mark trim done → edit transcript → Save (auto pipeline unless EDITOR_AUTO_PIPELINE=0) "
-        f"or run_pipeline --skip 00,01 manually"
+        f"✓ {base} step 00 complete ({t1 - t0:.1f}s). {_post_step00_hint(base, tmp_dir)}"
     )
     return True
 

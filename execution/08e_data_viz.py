@@ -5,7 +5,7 @@ fullscreen animated visualization (progress ring) for a couple of seconds
 at each detection. Audio continues under the cutaway.
 
 Pipeline:
-  1. Parse .tmp/{base}_transcript.json for percentage mentions (regex +
+  1. Parse .tmp/{trim_stem}_transcript.json (trim/ingest stem via stem_for_editor_gate) for percentage mentions (regex +
      PT-BR number words). Each hit gets its word-level start/end timestamps.
   2. Optional: send hits to OpenRouter for enrichment (label, duration,
      emphasis=growth/drop/neutral). Falls back to deterministic defaults
@@ -39,6 +39,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 
+from editor_gate import stem_for_editor_gate
 from openrouter_client import (
     chat_completion,
     has_openrouter_api_key,
@@ -114,17 +115,22 @@ def _resolve_original_source_under_input(video_path: str, base: str) -> str | No
 def _resolve_transcript_path(video_path: str, tmp_dir: str) -> tuple[str | None, list[str]]:
     """Return (path, tried_paths) for the first existing non-empty transcript JSON.
 
-    Order: ``.tmp/{base}_transcript.json``, then beside the original file under
-    ``input/`` (``{original_dir}/{original_stem}_transcript.json``).
+    ``run_pipeline`` passes the current intermediate ``.mp4`` (e.g. ``…_fx.mp4``);
+    transcripts are keyed by the trim/ingest stem. Same as 08b/08c: use
+    ``stem_for_editor_gate`` to map the filename stem to ``.tmp/{stem}_transcript.json``,
+    then beside the original under ``input/`` (``{original_dir}/{orig_stem}_transcript.json``).
     """
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    raw_stem = os.path.splitext(os.path.basename(video_path))[0]
+    transcript_base = stem_for_editor_gate(raw_stem)
     tried: list[str] = []
-    tmp_transcript = os.path.abspath(os.path.join(tmp_dir, f"{base}_transcript.json"))
+    tmp_transcript = os.path.abspath(
+        os.path.join(tmp_dir, f"{transcript_base}_transcript.json")
+    )
     tried.append(tmp_transcript)
     if os.path.isfile(tmp_transcript) and os.path.getsize(tmp_transcript) > 0:
         return tmp_transcript, tried
 
-    orig = _resolve_original_source_under_input(video_path, base)
+    orig = _resolve_original_source_under_input(video_path, transcript_base)
     if orig:
         orig_stem = os.path.splitext(os.path.basename(orig))[0]
         beside = os.path.abspath(
@@ -839,6 +845,14 @@ def apply_data_viz(video_path: str, tmp_dir: str = ".tmp") -> str:
         print("[08e] DATAVIZ_DISABLE=1, skipping.")
         return ""
 
+    transcript_base = stem_for_editor_gate(base)
+    if base != transcript_base:
+        print(
+            f"[08e] Transcript stem: {base!r} → {transcript_base!r} "
+            f"(using .tmp/{transcript_base}_transcript.json)",
+            flush=True,
+        )
+
     transcript_path, tried = _resolve_transcript_path(video_path, tmp_dir)
     if not transcript_path:
         print("[08e] No transcript found; checked:")
@@ -846,7 +860,9 @@ def apply_data_viz(video_path: str, tmp_dir: str = ".tmp") -> str:
             print(f"    - {p}")
         print("[08e] Skipping.")
         return ""
-    if transcript_path != os.path.abspath(os.path.join(tmp_dir, f"{base}_transcript.json")):
+    if transcript_path != os.path.abspath(
+        os.path.join(tmp_dir, f"{transcript_base}_transcript.json")
+    ):
         print(f"[08e] Using transcript beside original: {transcript_path}")
 
     # Resolve input video. Run after 08d (fx_sounds) so we overlay onto the

@@ -22,7 +22,8 @@ Typical flow:
      runs automatically unless ``EDITOR_AUTO_TRANSCRIBE=0``.
   3. Edit the transcript → **Save** (after a short debounce, steps 02+ run
      automatically unless ``EDITOR_AUTO_PIPELINE=0``), or use **Mark transcript
-     review done** to confirm + run immediately.
+     review done** to confirm + run immediately, or **Run 02+** in the sidebar
+     to start post-01 steps manually (always, including when auto-pipeline is off).
 
 Usage:
   python execution/00b_editor.py                  # default port 5058
@@ -50,7 +51,7 @@ import webbrowser
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -182,6 +183,24 @@ def _run_pipeline_steps_post_01(base: str, tmp_dir: str) -> None:
     finally:
         with _pipeline_active_lock:
             _pipeline_active_bases.discard(base)
+
+
+def start_pipeline_post_01_in_background(base: str, tmp_dir: str) -> None:
+    """Run steps 02+ in a background thread (equivalent to ``run_pipeline`` with 00+01 skipped).
+
+    Unlike ``run_pipeline_after_review_confirm``, this always starts the run — useful when
+    ``EDITOR_AUTO_PIPELINE=0`` or to retry 02+ without re-saving the transcript. Editor
+    gates in ``process_video`` still apply unless the user uses the CLI with
+    ``--skip-editor-gate``.
+    """
+    def job() -> None:
+        try:
+            _run_pipeline_steps_post_01(base, tmp_dir)
+        except Exception as e:
+            print(f"[00b-editor] Pipeline (02+) failed: {e}", file=sys.stderr)
+            traceback.print_exc()
+
+    threading.Thread(target=job, name=f"pipeline-02p-{base}", daemon=True).start()
 
 
 def _complete_review_and_run_pipeline(base: str, tmp_dir: str) -> None:
@@ -686,6 +705,54 @@ def list_editable_files(tmp_dir: str = ".tmp") -> list[dict[str, Any]]:
     return out
 
 
+def list_finalized_videos(output_dir: str = "output") -> list[dict[str, Any]]:
+    """List ``{output_dir}/*_final.mp4`` files produced by the pipeline."""
+    root = os.path.abspath(output_dir)
+    if not os.path.isdir(root):
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(glob.glob(os.path.join(root, "*_final.mp4"))):
+        if not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        try:
+            dur = _probe_duration(path)
+        except Exception:  # noqa: BLE001
+            dur = 0.0
+        st = os.stat(path)
+        base = name[: -len("_final.mp4")] if name.endswith("_final.mp4") else os.path.splitext(name)[0]
+        out.append(
+            {
+                "path": os.path.abspath(path),
+                "name": name,
+                "base": base,
+                "duration": round(dur, 2),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+            }
+        )
+    return out
+
+
+def _resolve_output_final_path(output_dir: str, name: str) -> str | None:
+    """Resolve a single basename under ``output_dir`` to an existing ``*_final.mp4`` file."""
+    raw = unquote((name or "").strip())
+    if not raw or "/" in raw or "\\" in raw or raw.startswith(".."):
+        return None
+    if not raw.endswith("_final.mp4"):
+        return None
+    root = os.path.abspath(output_dir)
+    full = os.path.normpath(os.path.join(root, raw))
+    try:
+        if os.path.commonpath([full, root]) != root:
+            return None
+    except ValueError:
+        return None
+    if os.path.isfile(full):
+        return full
+    return None
+
+
 # ============================================================================ #
 # Session (current editor target)
 # ============================================================================ #
@@ -985,8 +1052,11 @@ INDEX_HTML = r"""<!doctype html>
       display: flex; align-items: center; gap: 6px;
     }
     .group .group-title .base {
+      flex: 1; min-width: 0;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    .group .group-title .spacer { flex: 0 0 auto; }
+    .group .group-title .pipeline-skip-01 { flex-shrink: 0; }
     .group .group-gate {
       display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
       padding: 8px 12px;
@@ -1351,6 +1421,30 @@ INDEX_HTML = r"""<!doctype html>
 
     .view { display: none; }
     .view.active { display: block; }
+
+    /* Finalized outputs (sidebar) */
+    .final-list { display: grid; gap: 8px; max-height: 38vh; overflow-y: auto; padding-right: 2px; }
+    .final-row {
+      border-radius: 12px; background: var(--glass-strong);
+      border: 1px solid var(--line); padding: 10px 12px;
+    }
+    .final-row .final-name {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 11px; font-weight: 600; color: var(--secondary);
+      word-break: break-all; line-height: 1.35;
+    }
+    .final-row .final-line2 {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+    }
+    .final-row .final-line2 .meta { margin-left: 0; }
+    a.button-link, a.button-link:visited {
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 8px 10px; font-size: 12px; font-weight: 600;
+      border-radius: 10px; border: 1px solid var(--line);
+      background: var(--glass-strong); color: var(--text); text-decoration: none;
+      font-family: inherit; cursor: pointer; box-sizing: border-box;
+    }
+    a.button-link:hover { box-shadow: 0 4px 14px rgba(24,86,255,0.12); }
   </style>
 </head>
 <body>
@@ -1372,8 +1466,17 @@ INDEX_HTML = r"""<!doctype html>
         <input id="file-search" class="search" type="text" placeholder="Filter files…" />
         <div id="file-groups" class="file-groups"></div>
         <div class="sidebar-actions">
-          <button type="button" class="small" id="btn-refresh">Refresh</button>
+          <button type="button" class="small" id="btn-refresh">Refresh all</button>
           <span class="hint" style="margin-left:auto">from <code>.tmp/</code></span>
+        </div>
+      </div>
+      <div class="card finalized-card" style="margin-top:16px">
+        <h2>Finalized <span class="pill" id="finalized-count">0</span></h2>
+        <input id="finalized-search" class="search" type="search" placeholder="Filter outputs…" />
+        <div id="finalized-list" class="final-list"></div>
+        <div class="sidebar-actions">
+          <button type="button" class="small" id="btn-refresh-finalized">Refresh</button>
+          <span class="hint" style="margin-left:auto">from <code>output/</code></span>
         </div>
       </div>
     </aside>
@@ -1384,7 +1487,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="view-welcome" class="view active card">
         <div class="welcome">
           <div class="big">Pick a file to edit</div>
-          <p>The sidebar lists files in <code>.tmp/</code>. <strong>Order:</strong> trim → <strong>Mark trim done</strong> (auto-transcribe) → edit transcript → <strong>Save</strong> (after ~3s idle, the rest of the pipeline runs; tune with <code>EDITOR_AUTO_PIPELINE_DEBOUNCE</code>) or <strong>Mark transcript review done</strong> for an immediate run. Set <code>EDITOR_AUTO_PIPELINE=0</code> to only run <code>run_pipeline.py --skip 00,01</code> manually. New trim clears gates until you confirm again.</p>
+          <p>The sidebar lists files in <code>.tmp/</code>. <strong>Order:</strong> trim → <strong>Mark trim done</strong> (auto-transcribe) → edit transcript → <strong>Save</strong> (after ~3s idle, the rest of the pipeline runs; tune with <code>EDITOR_AUTO_PIPELINE_DEBOUNCE</code>) or <strong>Mark transcript review done</strong> for an immediate run. Each project title has <strong>Run 02+</strong> to start post-01 steps anytime (same as <code>run_pipeline.py --skip 00,01</code>; still respects editor gates). Set <code>EDITOR_AUTO_PIPELINE=0</code> and use <strong>Run 02+</strong> or the CLI when you want manual control. New trim clears gates until you confirm again.</p>
         </div>
       </div>
 
@@ -1489,6 +1592,20 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
       </div>
+
+      <!-- Final output preview (play from sidebar) -->
+      <div id="view-output" class="view">
+        <div class="card">
+          <h2>Final output <span id="output-title" class="pill"></span></h2>
+          <div class="toolbar" style="margin-bottom:10px">
+            <button type="button" class="small ghost" id="btn-output-back">Back</button>
+            <span class="hint">Pipeline exports <code>*_final.mp4</code> here after captions (and later steps overwrite the same file).</span>
+          </div>
+          <div class="video-wrap">
+            <video id="output-player" preload="metadata" controls playsinline></video>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -1529,9 +1646,19 @@ INDEX_HTML = r"""<!doctype html>
     const hideOverlay = () => { $("overlay").classList.remove("show"); };
 
     function showView(name) {
-      for (const v of ["welcome","video","transcript"]) {
-        $("view-" + v).classList.toggle("active", v === name);
+      for (const v of ["welcome", "video", "transcript", "output"]) {
+        const el = $("view-" + v);
+        if (el) el.classList.toggle("active", v === name);
       }
+    }
+
+    let outputReturnView = "welcome";
+    function closeOutputPlayer() {
+      const v = $("output-player");
+      try { v.pause(); } catch (e) { /* ignore */ }
+      v.removeAttribute("src");
+      try { v.load(); } catch (e) { /* ignore */ }
+      showView(outputReturnView);
     }
 
     //////////////////////////////////////////////////////////////////////////
@@ -1539,6 +1666,7 @@ INDEX_HTML = r"""<!doctype html>
     //////////////////////////////////////////////////////////////////////////
     const app = {
       files: [],
+      finalized: [],
       currentPath: null,
       kind: null,  // "video" | "transcript" | null
       video: {
@@ -1567,6 +1695,60 @@ INDEX_HTML = r"""<!doctype html>
       const data = await r.json();
       app.files = data.files || [];
       renderFiles();
+    }
+
+    async function refreshFinalized() {
+      const r = await fetch("/api/finalized");
+      const data = await r.json();
+      app.finalized = data.items || [];
+      renderFinalized();
+    }
+
+    function renderFinalized() {
+      const filter = ($("finalized-search").value || "").trim().toLowerCase();
+      const items = (app.finalized || []).filter(
+        (x) => !filter || (x.name || "").toLowerCase().includes(filter)
+      );
+      $("finalized-count").textContent = String(items.length);
+      const host = $("finalized-list");
+      if (!items.length) {
+        host.innerHTML = '<div class="empty">No <code>*_final.mp4</code> in <code>output/</code> yet.<br />Finish the pipeline (through captions and beyond).</div>';
+        return;
+      }
+      host.innerHTML = items.map((it, idx) => {
+        const nameEsc = escapeHtml(it.name);
+        const enc = encodeURIComponent(it.name);
+        return `<div class="final-row">
+          <div class="final-name" title="${nameEsc}">${nameEsc}</div>
+          <div class="final-line2">
+            <span class="meta">${(it.duration || 0).toFixed(1)}s · ${humanBytes(it.size || 0)}</span>
+            <span class="spacer" style="flex:1;min-width:4px"></span>
+            <button type="button" class="small primary play-final" data-idx="${idx}">Play</button>
+            <a class="button-link small" href="/api/finalized/download?name=${enc}" download>Download</a>
+          </div>
+        </div>`;
+      }).join("");
+      host.querySelectorAll(".play-final").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const it = items[+btn.getAttribute("data-idx")];
+          if (!it) return;
+          if (isDirty() && !confirm("You have unsaved changes. Open preview anyway?")) return;
+          const av = document.querySelector(".view.active");
+          if (av && av.id && av.id !== "view-output") {
+            const id = av.id.replace("view-", "");
+            if (id === "welcome" || id === "video" || id === "transcript") {
+              outputReturnView = id;
+            }
+          }
+          $("output-title").textContent = it.name;
+          const v = $("output-player");
+          v.src = "/api/finalized/stream?name=" + encodeURIComponent(it.name) + "&t=" + Date.now();
+          v.load();
+          showView("output");
+        });
+      });
     }
 
     function renderFiles() {
@@ -1602,7 +1784,9 @@ INDEX_HTML = r"""<!doctype html>
           ? `<span class="pill ok">trim ✓</span>`
           : `<button type="button" class="small warning gate-trim" data-base="${escapeHtml(g.base)}">Mark trim done</button>`;
         const reviewHint = !g.transcript
-          ? `<span class="hint">Transcribe runs after “Mark trim done” (or <code>--only 01</code> if auto is off)</span>`
+          ? (g.trim_review
+              ? `<span class="hint">Transcript missing after trim — run from repo root: <code>python execution/run_pipeline.py .tmp/${escapeHtml(g.base)}.mp4 --only 01</code></span>`
+              : `<span class="hint">Transcribe runs after “Mark trim done” (or <code>--only 01</code> if auto is off)</span>`)
           : "";
         const reviewOk = g.editor_review
           ? `<span class="pill ok">review ✓</span>`
@@ -1612,9 +1796,19 @@ INDEX_HTML = r"""<!doctype html>
             <div class="gate-row"><span class="gate-label">1 · Trim</span>${trimOk}${reviewHint}</div>
             <div class="gate-row"><span class="gate-label">2 · Transcript</span>${reviewOk}<span class="hint">Then <code>--skip 00,01</code></span></div>
           </div>`;
+        const hasVideo = !!g.video;
+        const run02BtnTitle = hasVideo
+          ? "Run steps 02+ (skips 00 and 01). Same as: python execution/run_pipeline.py .tmp/NAME.mp4 with only post-01 steps. Respects editor gates. Watch the terminal for logs."
+          : "No .tmp video for this base — add or convert a .mp4 first.";
         return `
           <div class="group">
-            <div class="group-title"><span class="base">${escapeHtml(g.base)}</span></div>
+            <div class="group-title">
+              <span class="base" title="${escapeHtml(g.base)}">${escapeHtml(g.base)}</span>
+              <span class="spacer" aria-hidden="true"></span>
+              <button type="button" class="small primary pipeline-skip-01" data-base="${escapeHtml(g.base)}"
+                title="${escapeHtml(run02BtnTitle)}"
+                ${hasVideo ? "" : "disabled"}>Run 02+</button>
+            </div>
             ${gate}
             ${rows.join("")}
           </div>`;
@@ -1640,7 +1834,7 @@ INDEX_HTML = r"""<!doctype html>
           if (!msg && url.includes("editor-review/trim")) {
             msg = data.auto_transcribe
               ? "Trim confirmed — transcribing in background (watch the terminal)"
-              : "Trim confirmed";
+              : "Trim confirmed — run step 01: python execution/run_pipeline.py .tmp/" + base + ".mp4 --only 01";
           }
           if (!msg && url.includes("editor-review/confirm")) {
             msg = data.auto_pipeline
@@ -1671,6 +1865,33 @@ INDEX_HTML = r"""<!doctype html>
           const base = btn.getAttribute("data-base");
           if (!base || btn.disabled) return;
           await postGate("/api/editor-review/confirm", base);
+        });
+      });
+      host.querySelectorAll(".pipeline-skip-01").forEach((btn) => {
+        btn.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (btn.disabled) return;
+          const base = btn.getAttribute("data-base");
+          if (!base) return;
+          showOverlay("Starting pipeline…");
+          try {
+            const r = await fetch("/api/pipeline/run-skip-00-01", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({ base }),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+              toast("Could not start pipeline: " + (data.error || r.statusText), "error");
+              return;
+            }
+            toast("Pipeline 02+ started — check the terminal for progress", "success");
+          } catch (e) {
+            toast("Request failed: " + e, "error");
+          } finally {
+            hideOverlay();
+          }
         });
       });
     }
@@ -1732,9 +1953,24 @@ INDEX_HTML = r"""<!doctype html>
       return false;
     }
 
-    $("btn-refresh").addEventListener("click", refreshFiles);
+    $("btn-refresh").addEventListener("click", async () => {
+      await refreshFiles();
+      await refreshFinalized();
+    });
+    $("btn-refresh-finalized").addEventListener("click", () => refreshFinalized().catch((err) => {
+      console.error(err);
+      toast("Refresh failed: " + err.message, "error");
+    }));
     $("file-search").addEventListener("input", renderFiles);
+    $("finalized-search").addEventListener("input", renderFinalized);
     $("btn-close").addEventListener("click", closeFile);
+    $("btn-output-back").addEventListener("click", closeOutputPlayer);
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $("view-output").classList.contains("active")) {
+        e.preventDefault();
+        closeOutputPlayer();
+      }
+    });
 
     //////////////////////////////////////////////////////////////////////////
     // Video editor
@@ -2321,7 +2557,7 @@ INDEX_HTML = r"""<!doctype html>
     // Boot
     //////////////////////////////////////////////////////////////////////////
     (async function boot() {
-      await refreshFiles();
+      await Promise.all([refreshFiles(), refreshFinalized()]);
       // If the server already has a file opened (e.g. launched with a path arg),
       // reflect it in the UI on load.
       const r = await fetch("/api/state");
@@ -2373,7 +2609,9 @@ def _parse_range(header: str, size: int) -> tuple[int, int] | None:
     return start, end
 
 
-def _build_handler(session: Session):
+def _build_handler(session: Session, output_dir: str):
+    output_dir = os.path.abspath(output_dir)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             sys.stderr.write("[00b-editor] " + (fmt % args) + "\n")
@@ -2396,15 +2634,23 @@ def _build_handler(session: Session):
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_video(self) -> None:
-            path = session.current_video_path()
-            if not path:
-                self.send_response(404); self.end_headers(); return
+        def _send_path_video(
+            self,
+            path: str,
+            *,
+            attachment: bool = False,
+            download_name: str | None = None,
+        ) -> None:
             try:
                 size = os.path.getsize(path)
             except OSError:
-                self.send_response(404); self.end_headers(); return
+                self.send_response(404)
+                self.end_headers()
+                return
             ctype = mimetypes.guess_type(path)[0] or "video/mp4"
+            disp = None
+            if attachment and download_name:
+                disp = f'attachment; filename="{download_name}"'
             rng = _parse_range(self.headers.get("Range", ""), size)
             if rng is None:
                 self.send_response(200)
@@ -2412,6 +2658,8 @@ def _build_handler(session: Session):
                 self.send_header("Content-Length", str(size))
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("Cache-Control", "no-store")
+                if disp:
+                    self.send_header("Content-Disposition", disp)
                 self.end_headers()
                 with open(path, "rb") as f:
                     shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
@@ -2424,6 +2672,8 @@ def _build_handler(session: Session):
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Cache-Control", "no-store")
+            if disp:
+                self.send_header("Content-Disposition", disp)
             self.end_headers()
             with open(path, "rb") as f:
                 f.seek(start)
@@ -2439,36 +2689,102 @@ def _build_handler(session: Session):
                         return
                     remaining -= len(data)
 
-        # ---- Routing ---- #
-        def do_GET(self):  # noqa: N802
-            path = urlparse(self.path).path
-            if path in ("/", "/index.html"):
-                self._send_html(INDEX_HTML); return
-            if path == "/api/files":
-                self._send_json(200, {"files": list_editable_files(session.tmp_dir)}); return
-            if path == "/api/state":
-                self._send_json(200, session.state()); return
-            if path == "/video":
-                self._send_video(); return
-            self.send_response(404); self.end_headers()
-
-        def do_HEAD(self):  # noqa: N802
-            if urlparse(self.path).path == "/video":
-                path = session.current_video_path()
-                if not path:
-                    self.send_response(404); self.end_headers(); return
-                try:
-                    size = os.path.getsize(path)
-                except OSError:
-                    self.send_response(404); self.end_headers(); return
-                ctype = mimetypes.guess_type(path)[0] or "video/mp4"
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(size))
-                self.send_header("Accept-Ranges", "bytes")
+        def _send_video(self) -> None:
+            path = session.current_video_path()
+            if not path:
+                self.send_response(404)
                 self.end_headers()
                 return
-            self.send_response(404); self.end_headers()
+            self._send_path_video(path)
+
+        def _head_path_video(self, path: str) -> None:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                self.send_response(404)
+                self.end_headers()
+                return
+            ctype = mimetypes.guess_type(path)[0] or "video/mp4"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+        # ---- Routing ---- #
+        def do_GET(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            q = parse_qs(parsed.query)
+            if path in ("/", "/index.html"):
+                self._send_html(INDEX_HTML)
+                return
+            if path == "/api/files":
+                self._send_json(200, {"files": list_editable_files(session.tmp_dir)})
+                return
+            if path == "/api/finalized":
+                self._send_json(200, {"items": list_finalized_videos(output_dir)})
+                return
+            if path == "/api/finalized/stream":
+                name = (q.get("name") or [""])[0]
+                out_path = _resolve_output_final_path(output_dir, name)
+                if not out_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._send_path_video(out_path)
+                return
+            if path == "/api/finalized/download":
+                name = (q.get("name") or [""])[0]
+                out_path = _resolve_output_final_path(output_dir, name)
+                if not out_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                base_name = os.path.basename(out_path)
+                self._send_path_video(out_path, attachment=True, download_name=base_name)
+                return
+            if path == "/api/state":
+                self._send_json(200, session.state())
+                return
+            if path == "/video":
+                self._send_video()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_HEAD(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            q = parse_qs(parsed.query)
+            if path == "/video":
+                vpath = session.current_video_path()
+                if not vpath:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._head_path_video(vpath)
+                return
+            if path == "/api/finalized/stream":
+                name = (q.get("name") or [""])[0]
+                out_path = _resolve_output_final_path(output_dir, name)
+                if not out_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._head_path_video(out_path)
+                return
+            if path == "/api/finalized/download":
+                name = (q.get("name") or [""])[0]
+                out_path = _resolve_output_final_path(output_dir, name)
+                if not out_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._head_path_video(out_path)
+                return
+            self.send_response(404)
+            self.end_headers()
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
@@ -2589,6 +2905,19 @@ def _build_handler(session: Session):
                 auto_p = run_pipeline_after_review_confirm(base, session.tmp_dir)
                 self._send_json(200, {"ok": True, "path": out, "auto_pipeline": auto_p}); return
 
+            if path == "/api/pipeline/run-skip-00-01":
+                base = str(body.get("base", "")).strip()
+                if not base:
+                    self._send_json(400, {"error": "missing base"}); return
+                if not editor_gate.tmp_base_has_video(session.tmp_dir, base):
+                    self._send_json(
+                        400,
+                        {"error": f"no .mp4 in .tmp for base {base!r}"},
+                    )
+                    return
+                start_pipeline_post_01_in_background(base, session.tmp_dir)
+                self._send_json(200, {"ok": True, "started": True}); return
+
             self.send_response(404); self.end_headers()
 
     return Handler
@@ -2604,6 +2933,7 @@ def serve(
     port: int = 5058,
     open_browser: bool = True,
     tmp_dir: str = ".tmp",
+    output_dir: str = "output",
 ) -> None:
     session = Session(tmp_dir=tmp_dir)
     if initial_path:
@@ -2612,10 +2942,12 @@ def serve(
         except (ValueError, FileNotFoundError, OSError, json.JSONDecodeError) as e:
             print(f"[00b-editor] Could not open {initial_path!r}: {e}", file=sys.stderr)
 
-    handler = _build_handler(session)
+    handler = _build_handler(session, output_dir)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
+    out_abs = os.path.abspath(output_dir)
     print(f"[00b-editor] Serving {os.path.abspath(tmp_dir)} on {url}  (Ctrl+C to stop)")
+    print(f"[00b-editor] Finalized list: {out_abs}/*_final.mp4")
     if _editor_auto_transcribe_enabled():
         print("[00b-editor] Auto-transcribe after trim: on (set EDITOR_AUTO_TRANSCRIBE=0 to disable)")
     else:
@@ -2650,6 +2982,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=5058, help="Local port (default: 5058).")
     ap.add_argument("--no-browser", action="store_true", help="Don't auto-open the browser.")
     ap.add_argument("--tmp-dir", default=".tmp", help="Directory to browse (default: .tmp).")
+    ap.add_argument(
+        "--output-dir",
+        default="output",
+        help="Directory for finalized *_final.mp4 listings and playback (default: output).",
+    )
     g_mark = ap.add_mutually_exclusive_group()
     g_mark.add_argument(
         "--mark-trim-done",
@@ -2699,6 +3036,7 @@ def main() -> int:
         port=args.port,
         open_browser=not args.no_browser,
         tmp_dir=args.tmp_dir,
+        output_dir=args.output_dir,
     )
     return 0
 

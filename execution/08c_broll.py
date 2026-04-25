@@ -60,6 +60,10 @@ POSITIONS = ["bottom"]
 # Aspect ratio above which an asset is considered "vertical" (portrait).
 # Small slack so ~square 1:1 doesn't get treated as vertical.
 VERTICAL_ASPECT_THRESHOLD = 1.05
+# If asset aspect ratio is within this relative tolerance of the main video,
+# treat as same "proportion" and use a fullscreen B-roll (full frame) instead
+# of the split panel.
+ASPECT_RATIO_MATCH_TOLERANCE = 0.012
 MAX_LLM_SEGMENTS = 80
 MAX_LLM_SEGMENT_TEXT = 220
 MAX_LLM_NEIGHBOR_TEXT = 100
@@ -97,6 +101,23 @@ def _is_vertical_asset(width: int, height: int) -> bool:
     if width <= 0:
         return False
     return (height / width) >= VERTICAL_ASPECT_THRESHOLD
+
+
+def _asset_aspect_matches_main_video(
+    asset: dict, vid_w: int, vid_h: int
+) -> bool:
+    """True when the asset's width/height ratio matches the main video's."""
+    aw = asset.get("width")
+    ah = asset.get("height")
+    if not isinstance(aw, int) or not isinstance(ah, int) or aw <= 0 or ah <= 0:
+        return False
+    vw = max(1, int(vid_w))
+    vh = max(1, int(vid_h))
+    a_ratio = aw / ah
+    v_ratio = vw / vh
+    if v_ratio <= 0:
+        return False
+    return abs(a_ratio - v_ratio) / v_ratio <= ASPECT_RATIO_MATCH_TOLERANCE
 
 
 def _find_input_source_paths_for_base(base: str, input_root: str) -> list[str]:
@@ -470,7 +491,13 @@ def suggest_segments_with_openrouter(
     return {}, None
 
 
-def match_assets_to_segments(assets: list, segments: list, video_duration: float) -> list:
+def match_assets_to_segments(
+    assets: list,
+    segments: list,
+    video_duration: float,
+    vid_w: int,
+    vid_h: int,
+) -> list:
     """Match each asset to the best transcript segment based on content.
     Falls back to even distribution if no keyword matches found."""
 
@@ -556,9 +583,10 @@ def match_assets_to_segments(assets: list, segments: list, video_duration: float
 
         # Cycle through animation/position styles
         anim = ANIMATIONS[idx % len(ANIMATIONS)]
-        # Vertical assets take the entire screen; horizontal ones use the
-        # split panel (bottom/top/left/right) as before.
-        if asset.get("is_vertical"):
+        # Full frame when the asset is portrait-style, or when its aspect
+        # ratio matches the main video so a split panel would only letterbox.
+        aspect_match = _asset_aspect_matches_main_video(asset, vid_w, vid_h)
+        if asset.get("is_vertical") or aspect_match:
             pos = "fullscreen"
         else:
             pos = POSITIONS[idx % len(POSITIONS)]
@@ -967,7 +995,9 @@ def apply_broll(video_path: str, tmp_dir: str = ".tmp") -> str:
         )
 
     # Match assets to transcript
-    placements = match_assets_to_segments(assets, segments, duration)
+    placements = match_assets_to_segments(
+        assets, segments, duration, vid_w, vid_h,
+    )
     if not placements:
         print("[08c] Could not place any B-rolls, skipping.")
         return ""

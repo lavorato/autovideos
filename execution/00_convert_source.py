@@ -20,8 +20,9 @@ Encoder choice — why libx264 veryfast CRF 20 instead of VideoToolbox:
 Behavior:
     - Always runs on .mov/.mkv/.avi sources (heavy codecs).
     - For other formats (.mp4/.webm/...), the source is probed and transcoded
-      only if its long edge exceeds 1920 px; otherwise it passes through
-      untouched.
+      only if its long edge exceeds 1920 px; otherwise the bytes are copied
+      (no re-encode) to .tmp/{base}.mp4 so 00b and the rest of the pipeline
+      always see a single working path under .tmp/.
     - Output: .tmp/{base}.mp4  (same base as the source → downstream tmp paths
       like .tmp/{base}_transcript.json remain unchanged)
     - Reuses an existing non-empty output (fast re-runs).
@@ -36,11 +37,13 @@ Environment overrides:
     SOURCE_TRANSCODE_PRESET libx264 preset (default: veryfast).
     SOURCE_MAX_LONG_EDGE  Long-edge cap in pixels (default: 1920).
 
-Returns the path that downstream steps should use (converted mp4 when
-transcoding happened, original path otherwise).
+Returns the path that downstream steps should use (always .tmp/{base}.mp4
+when the input lived elsewhere, or the same path if the input is already
+that file).
 """
 import json
 import os
+import shutil
 import sys
 import subprocess
 
@@ -86,35 +89,42 @@ def convert_source(video_path: str, tmp_dir: str = ".tmp") -> str:
     base = os.path.splitext(os.path.basename(video_path))[0]
     os.makedirs(tmp_dir, exist_ok=True)
     output_path = os.path.join(tmp_dir, f"{base}.mp4")
+    in_abs = os.path.abspath(video_path)
+    out_abs = os.path.abspath(output_path)
+
+    # Input is already the canonical .tmp working file — nothing to create.
+    if in_abs == out_abs:
+        print(f"[00] Source already at working path: {video_path}")
+        return video_path
+
+    # Reuse a non-empty .tmp copy from a previous run.
+    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+        in_mb = _size_mb(video_path)
+        out_mb = _size_mb(output_path)
+        print(
+            f"[00] Reusing cached working source: {output_path} "
+            f"({out_mb:.1f} MB; original {in_mb:.1f} MB)"
+        )
+        return output_path
 
     max_long_edge = int(os.getenv("SOURCE_MAX_LONG_EDGE", "1920"))
     width, height = _probe_dimensions(video_path)
     long_edge = max(width, height)
     oversized = long_edge > max_long_edge
-
     is_heavy = ext in HEAVY_EXTENSIONS
+
     if not is_heavy and not oversized:
         if long_edge:
             print(
                 f"[00] Source is {ext or 'unknown'} at {width}x{height} "
-                f"(long edge {long_edge} <= {max_long_edge}); using original."
+                f"(long edge {long_edge} <= {max_long_edge}); "
+                f"copying to {output_path} (no re-encode)."
             )
         else:
-            print(f"[00] Source is {ext or 'unknown'}; no transcode needed, using original.")
-        return video_path
-
-    # Avoid clobbering the source if the input itself lives at the output path.
-    if os.path.abspath(video_path) == os.path.abspath(output_path):
-        print(f"[00] Source already at output path; using original: {video_path}")
-        return video_path
-
-    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
-        in_mb = _size_mb(video_path)
-        out_mb = _size_mb(output_path)
-        print(
-            f"[00] Reusing cached transcoded source: {output_path} "
-            f"({out_mb:.1f} MB; original {in_mb:.1f} MB)"
-        )
+            print(
+                f"[00] Source is {ext or 'unknown'}; no transcode — copying to {output_path}."
+            )
+        shutil.copy2(video_path, output_path)
         return output_path
 
     in_mb = _size_mb(video_path)

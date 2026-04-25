@@ -23,6 +23,7 @@ import re
 import numpy as np
 import cv2
 import subprocess
+from editor_gate import stem_for_editor_gate
 from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
 from video_encoding import build_fast_pipeline_encode_args
 
@@ -231,16 +232,31 @@ def _extract_json_object(text: str) -> dict | None:
 
 
 def _load_transcript_segments(video_path: str, tmp_dir: str = ".tmp") -> list:
-    """Load segments from the Whisper transcript if present."""
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    """Load segments from the Whisper transcript if present.
+
+    ``run_pipeline`` passes the current intermediate ``.mp4`` (e.g. …_studio.mp4);
+    transcripts stay keyed by the trim/ingest stem (e.g. ``IMG_17922_transcript.json``).
+    """
+    raw_stem = os.path.splitext(os.path.basename(video_path))[0]
+    base = stem_for_editor_gate(raw_stem)
     transcript_path = os.path.join(tmp_dir, f"{base}_transcript.json")
+    if raw_stem != base:
+        print(
+            f"[08b] Transcript stem: {raw_stem!r} → {base!r} "
+            f"(using .tmp/{base}_transcript.json)",
+            flush=True,
+        )
     if not os.path.exists(transcript_path):
+        print(
+            f"[08b] No transcript file at {transcript_path}",
+            flush=True,
+        )
         return []
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"[08b] Could not read transcript: {exc}")
+        print(f"[08b] Could not read transcript: {exc}", flush=True)
         return []
     segs = data.get("segments") or []
     return segs if isinstance(segs, list) else []
@@ -301,8 +317,17 @@ def suggest_zoom_moments_with_openrouter(
         f"Segments:\n{json.dumps(payload_segments, ensure_ascii=False)}"
     )
 
+    print(
+        f"[08b][openrouter] calling LLM: {len(models)} model(s), "
+        f"up to {min(len(segments), MAX_LLM_SEGMENTS)} segment(s), "
+        f"duration={duration:.3f}s",
+        flush=True,
+    )
     for model in models:
-        print(f"[08b] OpenRouter: trying model '{model}' for zoom moment detection...")
+        print(
+            f"[08b][openrouter] trying model={model!r}",
+            flush=True,
+        )
         try:
             response_text = chat_completion(
                 model=model,
@@ -312,12 +337,18 @@ def suggest_zoom_moments_with_openrouter(
                 max_tokens=900,
             )
         except Exception as exc:
-            print(f"[08b] OpenRouter '{model}' failed: {exc}")
+            print(f"[08b][openrouter] model={model!r} request_failed: {exc}", flush=True)
             continue
 
         parsed = _extract_json_object(response_text)
         if not parsed:
-            print(f"[08b] OpenRouter '{model}' returned non-JSON output.")
+            preview = (response_text or "").strip().replace("\n", " ")
+            if len(preview) > 500:
+                preview = preview[:500] + "…"
+            print(
+                f"[08b][openrouter] model={model!r} parse_failed: raw preview: {preview!r}",
+                flush=True,
+            )
             continue
 
         raw_moments = parsed.get("moments", [])
@@ -365,11 +396,18 @@ def suggest_zoom_moments_with_openrouter(
                 break
 
         if deduped:
-            print(f"[08b] OpenRouter selected {len(deduped)} zoom moment(s) with model '{model}'.")
+            print(
+                f"[08b][openrouter] ok model={model!r} moments={len(deduped)}",
+                flush=True,
+            )
             return deduped, model
 
-        print(f"[08b] OpenRouter '{model}' returned no usable moments.")
+        print(
+            f"[08b][openrouter] model={model!r} returned no usable moments after validation.",
+            flush=True,
+        )
 
+    print("[08b][openrouter] all models exhausted; no zoom moments.", flush=True)
     return [], None
 
 
@@ -443,10 +481,23 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
     ai_zoom_segments: list = []
     ai_model: str | None = None
     ai_moments: list = []
+    transcript_base = stem_for_editor_gate(
+        os.path.splitext(os.path.basename(video_path))[0]
+    )
+    transcript_path_guess = os.path.join(tmp_dir, f"{transcript_base}_transcript.json")
     if has_openrouter_api_key():
         candidate_models = parse_models_from_env()
+        print(
+            f"[08b][openrouter] probe: api_key=set models={candidate_models!r} "
+            f"transcript_expected={transcript_path_guess!r}",
+            flush=True,
+        )
         if candidate_models:
             transcript_segments = _load_transcript_segments(video_path, tmp_dir)
+            print(
+                f"[08b][openrouter] transcript_segments={len(transcript_segments)}",
+                flush=True,
+            )
             if transcript_segments:
                 moments, ai_model = suggest_zoom_moments_with_openrouter(
                     segments=transcript_segments,
@@ -456,13 +507,35 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str = ".tmp") -> str:
                 if moments:
                     for m in moments:
                         reason = f" — {m['reason']}" if m.get("reason") else ""
-                        print(f"  Zoom moment: {m['start']:.2f}s → {m['end']:.2f}s{reason}")
+                        print(
+                            f"[08b][openrouter] moment {m['start']:.2f}s → {m['end']:.2f}s{reason}",
+                            flush=True,
+                        )
                     ai_zoom_segments = _segments_from_zoom_moments(moments, duration)
                     ai_moments = moments
+                    print(
+                        f"[08b][openrouter] result: using_ai_zoom model={ai_model!r} "
+                        f"moments={len(ai_moments)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[08b][openrouter] result: llm_ok_but_no_moments → fixed cut interval",
+                        flush=True,
+                    )
             else:
-                print("[08b] No transcript found; skipping AI zoom moment detection.")
+                print(
+                    "[08b][openrouter] skip: no transcript segments "
+                    "(check path above)",
+                    flush=True,
+                )
         else:
-            print("[08b] OPENROUTER_API_KEY found, but no OPENROUTER_MODEL(S) configured.")
+            print(
+                "[08b][openrouter] skip: OPENROUTER_MODEL(S) not set",
+                flush=True,
+            )
+    else:
+        print("[08b][openrouter] skip: OPENROUTER_API_KEY not set", flush=True)
 
     # Persist AI moments (or empty list) so downstream steps — e.g. 08d FX
     # sounds — know where the impactful beats are without re-querying the LLM.
