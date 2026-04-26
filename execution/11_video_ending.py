@@ -17,6 +17,8 @@ from video_encoding import (
     build_color_preserving_composite_encode_args,
     ensure_mp4_aac_stereo_48k,
     first_existing_nonempty_video,
+    probe_primary_video_length_seconds,
+    whole_len_samples_48k,
 )
 
 
@@ -141,9 +143,16 @@ def append_video_ending(
         print(f"[11] Ending file has no duration, skipping: {ending_path}")
         return input_video
 
-    main_dur = _duration(input_video)
+    main_dur = max(
+        _duration(input_video), probe_primary_video_length_seconds(input_video) or 0.0
+    )
+    if main_dur <= 0:
+        print(f"[11] Main duration is 0, skipping: {input_video!r}")
+        return input_video
+
     main_has_a = _has_audio_stream(input_video)
     end_has_a = _has_audio_stream(ending_path)
+    wl_main = whole_len_samples_48k(main_dur)
 
     v_main = f"[0:v]setpts=PTS-STARTPTS,fps={fps},format=yuv420p[vm0]"
     v_end = (
@@ -153,9 +162,10 @@ def append_video_ending(
     )
 
     if main_has_a:
+        # Pad 0:a to main_dur so concat matches vm0 when talk track is short.
         a_main = (
-            "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-            "asetpts=PTS-STARTPTS[am0]"
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"atrim=0:{main_dur},apad=whole_len={wl_main},asetpts=PTS-STARTPTS[am0]"
         )
     else:
         a_main = (

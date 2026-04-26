@@ -45,6 +45,7 @@ from importlib import import_module
 
 import editor_gate
 import env_paths
+from video_encoding import verify_mp4_av_streams
 
 # All steps in pipeline order. "enabled" is the default state.
 ALL_STEPS = [
@@ -301,8 +302,23 @@ def verify_step_output(step: dict, video_path: str) -> bool:
                 print(f"    - {p}")
         return False
 
+    fail_on_av = os.environ.get("VIDEOS_FAIL_ON_AVSYNC", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
     for path in expected_files:
         print(f"  Verified output: {path}")
+        p_low = path.lower()
+        if p_low.endswith((".mp4", ".m4v", ".mov")):
+            ok_av, av_msg = verify_mp4_av_streams(path, max_gap_sec=0.25)
+            if not ok_av and av_msg:
+                print(f"  WARNING: {av_msg}")
+                if fail_on_av:
+                    print("  VERIFY FAILED: A/V length mismatch (VIDEOS_FAIL_ON_AVSYNC=1).")
+                    return False
     return True
 
 

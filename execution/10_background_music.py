@@ -14,6 +14,9 @@ from video_encoding import (
     build_color_preserving_composite_encode_args,
     ensure_mp4_aac_stereo_48k,
     first_existing_nonempty_video,
+    probe_primary_video_length_seconds,
+    probe_stream_duration_seconds,
+    whole_len_samples_48k,
 )
 
 # --- Config ---
@@ -102,15 +105,28 @@ def add_background_music(
     print(f"[10] Selected track: {os.path.basename(track)}")
     print(f"[10] Music volume: {MUSIC_VOLUME} ({int(MUSIC_VOLUME * 100)}%)")
 
-    video_duration = get_duration(input_video)
+    fmt_dur = get_duration(input_video)
+    v_len = probe_primary_video_length_seconds(input_video) or 0.0
+    # Muxes with short a:0 can report format.duration = audio; never mix to that.
+    video_duration = max(fmt_dur, v_len)
+    a0 = probe_stream_duration_seconds(input_video, "a:0")
+    if a0 is not None and abs(a0 - video_duration) > 0.1:
+        print(
+            f"[10] A/V in source: video {video_duration:.2f}s vs audio {a0:.2f}s "
+            f"(padding voice+music to video length)"
+        )
     track_duration = get_duration(track)
     print(f"[10] Video: {video_duration:.1f}s, Track: {track_duration:.1f}s")
 
     # Build audio filter:
     # Prepare music: loop if needed, trim, apply volume, fade, force stereo.
+    # Pad the voice stream to *video_duration* (apad) before `amerge`, because
+    # `amerge` ends at the shortest input — without padding, a short talk track
+    # clips the mixed output while video stays long (silent tail).
     # Then merge with original audio and sum channels explicitly via `pan`
     # so the original audio passes through at unit gain (no amix normalization).
     fade_start = max(0, video_duration - FADE_OUT_DURATION)
+    wl = whole_len_samples_48k(video_duration)
 
     if track_duration < video_duration:
         loops_needed = int(video_duration / track_duration) + 1
@@ -126,7 +142,8 @@ def add_background_music(
         f"afade=t=out:st={fade_start}:d={FADE_OUT_DURATION},"
         f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
         f"[music];"
-        f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[orig];"
+        f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        f"atrim=0:{video_duration},apad=whole_len={wl},asetpts=PTS-STARTPTS[orig];"
         f"[orig][music]amerge=inputs=2[merged];"
         f"[merged]pan=stereo|c0=c0+c2|c1=c1+c3,"
         f"atrim=0:{video_duration},asetpts=PTS-STARTPTS[outa]"

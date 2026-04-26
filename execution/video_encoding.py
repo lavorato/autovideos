@@ -4,6 +4,7 @@ Shared video encoding settings for quality/color preservation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 
@@ -290,3 +291,141 @@ def ensure_mp4_aac_stereo_48k(video_path: str) -> bool:
         f"[encode] Re-encoded audio to AAC 48kHz stereo (was {codec}): {video_path}"
     )
     return True
+
+
+def whole_len_samples_48k(duration_sec: float) -> int:
+    """
+    Channel sample count to cover *duration_sec* at 48 kHz (ceiling)
+    for FFmpeg ``apad=whole_len=...``.
+    """
+    return max(1, int(math.ceil(float(duration_sec) * 48000.0)))
+
+
+def probe_stream_duration_seconds(video_path: str, stream_selector: str) -> float | None:
+    """
+    Return duration in seconds for ``v:0`` or ``a:0``, or None if the stream
+    is missing or probe fails.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    try:
+        p = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                stream_selector,
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return None
+    raw = (p.stdout or "").strip()
+    if not raw or raw in ("N/A", "0"):
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def probe_primary_video_length_seconds(video_path: str) -> float | None:
+    """
+    Best estimate of the first video track length in seconds. Uses stream
+    *duration* when set; *format* duration; and ``nb_frames / r_frame_rate`` when
+    stream duration is N/A in the container. Take the max of all candidates so
+    we never under-estimate when ``format=duration`` incorrectly tracks a short
+    audio stream (A/V desync in bad muxes).
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    try:
+        p = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration,nb_frames,r_frame_rate",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return None
+    data = json.loads(p.stdout or "{}")
+    st = (data.get("streams") or [{}])[0] or {}
+    fmt = data.get("format") or {}
+    cands: list[float] = []
+    d = st.get("duration")
+    if d not in (None, "", "N/A", "0"):
+        try:
+            cands.append(float(d))
+        except (TypeError, ValueError):
+            pass
+    fd = fmt.get("duration")
+    if fd not in (None, "", "N/A", "0"):
+        try:
+            cands.append(float(fd))
+        except (TypeError, ValueError):
+            pass
+    nbf = st.get("nb_frames")
+    rate = str(st.get("r_frame_rate") or st.get("avg_frame_rate") or "30/1")
+    if nbf and str(nbf).isdigit() and int(nbf) > 0 and rate not in ("0/0", "unknown", ""):
+        try:
+            a, b = rate.split("/")
+            fden = float(b) if float(b) else 1.0
+            fps = float(a) / fden
+            if fps > 0:
+                cands.append(int(nbf) / fps)
+        except (ValueError, ZeroDivisionError):
+            pass
+    if not cands:
+        return None
+    return max(cands)
+
+
+def verify_mp4_av_streams(
+    video_path: str, max_gap_sec: float = 0.25
+) -> tuple[bool, str]:
+    """
+    Return (True, short_message) if OK; (False, reason) if video+audio exist
+    and |v - a| > *max_gap_sec*.
+
+    Non-MP4 or missing file is OK. No audio (music-only or silent) returns OK
+    (cannot compare). V-only is OK. Both streams must be present to enforce.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return (True, "")
+    if not str(video_path).lower().endswith((".mp4", ".m4v", ".mov")):
+        return (True, "")
+    v = probe_stream_duration_seconds(video_path, "v:0")
+    v_rob = probe_primary_video_length_seconds(video_path)
+    if v_rob is not None:
+        v = v_rob if v is None else max(v, v_rob)
+    a = probe_stream_duration_seconds(video_path, "a:0")
+    if v is None or a is None:
+        return (True, "")
+    diff = abs(v - a)
+    if diff <= max_gap_sec:
+        return (True, f"A/V OK: v={v:.3f}s a={a:.3f}s")
+    return (
+        False,
+        f"A/V length mismatch: video={v:.3f}s audio={a:.3f}s (|Δ|={diff:.2f}s)",
+    )

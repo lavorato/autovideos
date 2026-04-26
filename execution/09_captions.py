@@ -30,7 +30,11 @@ from video_encoding import (
     build_moviepy_lossless_params,
     ensure_mp4_aac_stereo_48k,
     first_existing_nonempty_video,
+    probe_first_audio_codec_name,
+    probe_primary_video_length_seconds,
+    probe_stream_duration_seconds,
     source_color_normalize_filter,
+    whole_len_samples_48k,
 )
 
 
@@ -160,6 +164,12 @@ def _probe_video_geometry(video_path: str) -> dict:
         duration = float(duration)
     except (TypeError, ValueError):
         duration = 0.0
+
+    # Some muxes have N/A on v:duration and format=duration that tracks short audio;
+    # nb_frames+fps and probe_primary give the real picture length.
+    v_rob = probe_primary_video_length_seconds(video_path)
+    if v_rob is not None and v_rob > 0:
+        duration = max(duration, v_rob)
 
     return {
         "fps": fps,
@@ -330,7 +340,10 @@ def _remotion_concurrency() -> str:
 
 
 def _composite_overlay_with_ffmpeg(
-    source_video: str, overlay_mov: str, output_path: str,
+    source_video: str,
+    overlay_mov: str,
+    output_path: str,
+    align_audio_to_sec: float,
 ) -> None:
     """
     Overlay the transparent caption track (ProRes 4444 w/ alpha) onto the
@@ -339,17 +352,35 @@ def _composite_overlay_with_ffmpeg(
     would often play on desktop only). Video is re-encoded with the same libx264
     + color normalization as step 08c (not VideoToolbox), so the exported final
     matches the b-roll composite's color and quality.
+
+    *align_audio_to_sec* is the target duration for the audio track to match
+    the composited video (same order as the overlay ``durationInFrames``/fps
+    and source video, max). Short voice tracks are padded with ``apad`` so the
+    muxed file does not end with a silent tail when the video is longer than
+    ``0:a``.
     """
     src_vf = source_color_normalize_filter(source_video)
     encode_args = build_color_preserving_composite_encode_args(source_video)
+    has_audio = bool(probe_first_audio_codec_name(source_video))
+    t_align = max(0.001, float(align_audio_to_sec))
+    wl = whole_len_samples_48k(t_align)
+    v_main = f"[0:v]{src_vf}[main];[main][1:v]overlay=0:0:format=auto:shortest=0[v]"
+    if has_audio:
+        a_pad = (
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"atrim=0:{t_align},apad=whole_len={wl},asetpts=PTS-STARTPTS[aud]"
+        )
+        filter_complex = f"{v_main};{a_pad}"
+        out_maps = ("-map", "[v]", "-map", "[aud]")
+    else:
+        filter_complex = v_main
+        out_maps = ("-map", "[v]", "-map", "0:a?")
     cmd = [
         "ffmpeg", "-y",
         "-i", source_video,
         "-i", overlay_mov,
-        "-filter_complex",
-        f"[0:v]{src_vf}[main];[main][1:v]overlay=0:0:format=auto:shortest=0[v]",
-        "-map", "[v]",
-        "-map", "0:a?",
+        "-filter_complex", filter_complex,
+        *out_maps,
         "-map_metadata", "0",
         *encode_args,
         "-c:a", "aac",
@@ -457,7 +488,19 @@ def _render_with_remotion(
         raise RuntimeError(f"[09] Remotion produced no overlay at {overlay_mov}")
 
     print("[09] Compositing overlay onto source video via FFmpeg...")
-    _composite_overlay_with_ffmpeg(input_video, overlay_mov, output_path)
+    fps = max(1e-6, float(geometry.get("fps") or 30.0))
+    ov_sec = float(duration_frames) / fps
+    v_len = probe_primary_video_length_seconds(input_video) or 0.0
+    a_len = probe_stream_duration_seconds(input_video, "a:0") or 0.0
+    geom = float(geometry.get("duration") or 0.0)
+    # Output [v] from overlay=shortest=0 is max(main, overlay) seconds; do not
+    # rely on format.duration/geometry if it only reflects a short a:0.
+    align_sec = max(geom, ov_sec, v_len, a_len)
+    if align_sec < 0.1:
+        align_sec = max(0.1, ov_sec, geom)
+    _composite_overlay_with_ffmpeg(
+        input_video, overlay_mov, output_path, align_audio_to_sec=align_sec
+    )
 
     try:
         os.remove(overlay_mov)
