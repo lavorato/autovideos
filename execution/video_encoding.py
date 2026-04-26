@@ -203,3 +203,90 @@ def build_moviepy_lossless_params(video_path: str) -> list[str]:
         "0",
         *_build_color_args(stream_info),
     ]
+
+
+def probe_first_audio_codec_name(video_path: str) -> str | None:
+    """Return ``codec_name`` of the first audio stream, or ``None`` if missing."""
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=nw=1:nk=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return None
+    name = (probe.stdout or "").strip()
+    return name or None
+
+
+def ensure_mp4_aac_stereo_48k(video_path: str) -> bool:
+    """
+    If the first audio stream is not AAC, remux in place: copy video, re-encode
+    audio to AAC-LC 192k stereo 48kHz, ``+faststart``. This matches what phones,
+    Android, and Instagram expect in MP4 (ALAC and other lossless tracks often
+    play on desktop only).
+
+    Returns True if a remux was performed, False if the file was already AAC
+    or had no audio. Raises on ffmpeg failure.
+    """
+    if not video_path or not os.path.isfile(video_path):
+        return False
+    codec = probe_first_audio_codec_name(video_path)
+    if codec is None or codec == "aac":
+        return False
+
+    root, ext = os.path.splitext(video_path)
+    temp_out = f"{root}.aac_stereo_48k_tmp{ext or '.mp4'}"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+        temp_out,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        if os.path.exists(temp_out):
+            try:
+                os.remove(temp_out)
+            except OSError:
+                pass
+        err = (e.stderr or "")[-800:]
+        raise RuntimeError(
+            f"ensure_mp4_aac_stereo_48k failed for {video_path!r} (was {codec}): {err}"
+        ) from e
+
+    os.replace(temp_out, video_path)
+    print(
+        f"[encode] Re-encoded audio to AAC 48kHz stereo (was {codec}): {video_path}"
+    )
+    return True

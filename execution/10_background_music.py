@@ -8,9 +8,11 @@ import os
 import random
 import subprocess
 
+import editor_gate
 import env_paths
 from video_encoding import (
     build_color_preserving_composite_encode_args,
+    ensure_mp4_aac_stereo_48k,
     first_existing_nonempty_video,
 )
 
@@ -54,7 +56,11 @@ def add_background_music(
         tmp_dir = env_paths.tmp_dir()
     if output_dir is None:
         output_dir = env_paths.output_dir()
-    base = os.path.splitext(os.path.basename(video_path))[0]
+    # Match 09: strip pipeline suffixes (_final, _fx, …) so we look up
+    # ``output/{base}_final.mp4`` — not ``{base}_final_final.mp4`` when 09+ just
+    # passed ``…/IMG_123_final.mp4`` (which would miss and pick stale .tmp/ files).
+    raw_stem = os.path.splitext(os.path.basename(video_path))[0]
+    base = editor_gate.stem_for_editor_gate(raw_stem)
 
     # Resolve input: prefer final, then intermediates (skip empty files)
     candidates = [
@@ -69,7 +75,17 @@ def add_background_music(
         os.path.join(tmp_dir, f"{base}_studio.mp4"),
         video_path,
     ]
-    input_video = first_existing_nonempty_video(candidates)
+    vp_abs = os.path.abspath(video_path)
+    if (
+        raw_stem != base
+        and os.path.isfile(vp_abs)
+        and os.path.getsize(vp_abs) > 0
+    ):
+        # Pipeline passes the real previous step output; trust it over any stale
+        # ``{base}_final.mp4`` on disk.
+        input_video = vp_abs
+    else:
+        input_video = first_existing_nonempty_video(candidates)
     if not input_video:
         print("[10] No readable input video, skipping.")
         return ""
@@ -131,7 +147,10 @@ def add_background_music(
         "-map", "0:v", "-map", "[outa]",
         "-map_metadata", "0",
         *encode_args,
-        "-c:a", "alac",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "48000",
+        "-ac", "2",
         "-movflags", "+faststart",
         actual_output,
     ]
@@ -145,6 +164,7 @@ def add_background_music(
     if use_temp:
         os.replace(actual_output, output_path)
 
+    ensure_mp4_aac_stereo_48k(output_path)
     print(f"[10] Output: {output_path}")
     return output_path
 

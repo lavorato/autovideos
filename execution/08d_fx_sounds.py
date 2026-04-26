@@ -2,9 +2,16 @@
 Step 8d: FX Sounds — overlay short sound effects at each "impactful moment"
 that step 08b's AI analysis identified in the transcript.
 
-The AI moments are read from `.tmp/{base}_zoom_moments.json` (produced by 08b).
-For every moment, we pick a random .wav from `fxs/` and mix it into the
-audio track at the moment's start time. Video is copied through untouched.
+The AI moments are read from `.tmp/{editor_gate_stem}_zoom_moments.json`
+(produced by 08b), with fallbacks for older sidecar names.
+For every moment, we pick a sound from `fxs/` and mix it into the audio
+track at the moment's start time. Video is copied through untouched.
+
+Optional keyword layer: if `fxs/fx_keywords.json` exists (or FX_KEYWORD_MAP),
+we match the moment's *context* (LLM "reason" plus transcript text around the
+same time window) against regex `rules` and/or a `keywords` map, and use
+the first matching file instead of a random effect. When nothing matches, the
+existing random (non–back-to-back) pool is used.
 
 If no moments exist (empty sidecar, no transcript, or OpenRouter disabled),
 the step is a no-op: the previous intermediate is re-used as-is by downstream
@@ -14,18 +21,23 @@ Tunables (env vars):
   - FX_VOLUME            (default 0.6)  — gain applied to each FX before mixing
   - FX_MAX_DURATION      (default 2.5)  — seconds; longer FX are trimmed to this
   - FX_DISABLE=1                        — skip the step entirely
+  - FX_KEYWORD_DISABLE=1                — ignore fx_keywords.json (random FX only)
+  - FX_KEYWORD_MAP=<path>               — override path to the keyword JSON
   - VIDEOS_FX_DIR / FX_DIR — folder to pick FX files from (default: fxs/)
 """
 import sys
 import os
+import re
 import json
 import random
 import subprocess
 
 import env_paths
+from editor_gate import stem_for_editor_gate
 from video_encoding import first_existing_nonempty_video
 FX_VOLUME = float(os.environ.get("FX_VOLUME", "0.6"))
 FX_MAX_DURATION = float(os.environ.get("FX_MAX_DURATION", "2.5"))
+FX_MOMENT_TEXT_PAD = float(os.environ.get("FX_MOMENT_TEXT_PAD", "0.35"))
 FX_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".ogg", ".flac"}
 # Everything is resampled to this shared sample rate before mixing so the
 # filter graph can sum samples deterministically regardless of how each FX
@@ -87,10 +99,194 @@ def _list_fx_files(fx_dir: str | None = None) -> list[str]:
     ]
 
 
-def _load_moments(base: str, tmp_dir: str) -> list:
-    """Return the AI-selected zoom moments for `base` or [] if unavailable."""
-    path = os.path.join(tmp_dir, f"{base}_zoom_moments.json")
-    if not os.path.exists(path):
+def _transcript_path_for_gate(gate: str, tmp_dir: str) -> str:
+    return os.path.join(tmp_dir, f"{gate}_transcript.json")
+
+
+def _load_transcript_segments(gate: str, tmp_dir: str) -> list:
+    path = _transcript_path_for_gate(gate, tmp_dir)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[08d] Could not read transcript {path}: {exc}")
+        return []
+    segs = data.get("segments") or []
+    if not isinstance(segs, list):
+        segs = []
+    if (not segs) and isinstance(data.get("words"), list):
+        for w in data["words"]:
+            if not isinstance(w, dict):
+                continue
+            txt = (w.get("word") or w.get("text") or "").strip()
+            if not txt:
+                continue
+            try:
+                s = float(w.get("start", 0.0))
+                e = float(w.get("end", s))
+            except (TypeError, ValueError):
+                continue
+            segs.append({"start": s, "end": e, "text": txt})
+    return segs
+
+
+def _moment_overlap_text(
+    start: float,
+    end: float | None,
+    segments: list,
+    pad: float = FX_MOMENT_TEXT_PAD,
+) -> str:
+    """Concatenate segment texts that overlap the moment window (for keyword FX)."""
+    if not segments:
+        return ""
+    t0 = max(0.0, start - pad)
+    t1 = end if end is not None and end > start else start + 2.0
+    t1 = t1 + pad
+    parts: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", s))
+        except (TypeError, ValueError):
+            continue
+        if e < t0 or s > t1:
+            continue
+        text = (seg.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def _fx_keyword_map_path(fx_dir: str) -> str:
+    override = (os.environ.get("FX_KEYWORD_MAP") or "").strip()
+    if override:
+        p = override if os.path.isabs(override) else os.path.normpath(
+            os.path.join(env_paths.REPO_ROOT, override)
+        )
+        return p
+    return os.path.join(fx_dir, "fx_keywords.json")
+
+
+def _load_fx_keyword_rules(fx_dir: str) -> list[tuple[re.Pattern, str]]:
+    """Load ordered (compiled regex, audio basename) pairs from JSON."""
+    if os.environ.get("FX_KEYWORD_DISABLE") == "1":
+        return []
+    path = _fx_keyword_map_path(fx_dir)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[08d] Could not read keyword map {path}: {exc}")
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[tuple[re.Pattern, str]] = []
+    for r in data.get("rules") or []:
+        if not isinstance(r, dict):
+            continue
+        pat = (r.get("pattern") or r.get("match") or "").strip()
+        fn = (r.get("file") or "").strip()
+        if not pat or not fn:
+            continue
+        try:
+            out.append((re.compile(pat, re.IGNORECASE | re.DOTALL), fn))
+        except re.error as exc:
+            print(f"[08d] fx_keywords rule skipped (bad regex) {pat!r}: {exc}")
+    kwd = data.get("keywords")
+    if isinstance(kwd, dict):
+        for key, val in sorted(kwd.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if not isinstance(key, str) or not isinstance(val, str):
+                continue
+            k = key.strip()
+            v = val.strip()
+            if not k or not v:
+                continue
+            out.append((re.compile(re.escape(k), re.IGNORECASE), v))
+    return out
+
+
+def _index_fx_by_basename(fx_files: list[str]) -> dict[str, str]:
+    return {os.path.basename(p): p for p in fx_files}
+
+
+def _resolve_fx_audio_path(
+    fx_dir: str, file_spec: str, by_base: dict[str, str],
+) -> str | None:
+    spec = (file_spec or "").strip()
+    if not spec:
+        return None
+    if os.path.isabs(spec) and os.path.isfile(spec):
+        return spec
+    b = os.path.basename(spec)
+    if b in by_base:
+        return by_base[b]
+    joined = os.path.join(fx_dir, b)
+    if os.path.isfile(joined):
+        return os.path.normpath(joined)
+    return None
+
+
+def _match_keyword_fx(
+    context: str,
+    rules: list[tuple[re.Pattern, str]],
+    fx_dir: str,
+    by_base: dict[str, str],
+) -> str | None:
+    if not context.strip() or not rules:
+        return None
+    for pat, file_spec in rules:
+        if not pat.search(context):
+            continue
+        path = _resolve_fx_audio_path(fx_dir, file_spec, by_base)
+        if path:
+            return path
+        print(
+            f"[08d] Keyword matched but audio missing: {file_spec!r} "
+            f"(in {fx_dir!r})"
+        )
+    return None
+
+
+def _resolve_zoom_moments_path(raw_stem: str, tmp_dir: str) -> str | None:
+    """Locate the 08b sidecar: same editor-gate base as the current .mp4 stem.
+
+    08b used to name the file after whatever intermediate it received (e.g.
+    ``…_voice_studio_fixed_audio_zoom_moments.json``) while 08d often runs on
+    ``…_broll.mp4``. We try the normalized stem, the raw stem, then any
+    ``*_zoom_moments.json`` whose stem matches ``stem_for_editor_gate``."""
+    gate = stem_for_editor_gate(raw_stem)
+    primary = os.path.join(tmp_dir, f"{gate}_zoom_moments.json")
+    alt = os.path.join(tmp_dir, f"{raw_stem}_zoom_moments.json")
+    for p in (primary, alt):
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    if os.path.isdir(tmp_dir):
+        suffix = "_zoom_moments.json"
+        matches: list[str] = []
+        for name in os.listdir(tmp_dir):
+            if not name.endswith(suffix):
+                continue
+            stem = name[: -len(suffix)]
+            if stem_for_editor_gate(stem) == gate:
+                p = os.path.join(tmp_dir, name)
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    matches.append(p)
+        if matches:
+            matches.sort()
+            return matches[0]
+    return None
+
+
+def _load_moments(raw_stem: str, tmp_dir: str) -> list:
+    """Return the AI-selected zoom moments for this pipeline base or []."""
+    path = _resolve_zoom_moments_path(raw_stem, tmp_dir)
+    if not path:
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -109,29 +305,39 @@ def _load_moments(base: str, tmp_dir: str) -> list:
             continue
         if start < 0:
             continue
-        cleaned.append({"start": start, "reason": str(m.get("reason", ""))})
+        end_raw = m.get("end")
+        end: float | None
+        if end_raw is not None and end_raw != "":
+            try:
+                end = float(end_raw)
+            except (TypeError, ValueError):
+                end = None
+        else:
+            end = None
+        cleaned.append({
+            "start": start,
+            "end": end,
+            "reason": str(m.get("reason", "")),
+        })
     cleaned.sort(key=lambda m: m["start"])
     return cleaned
 
 
-def _pick_fx_cycle(fx_files: list[str], count: int) -> list[str]:
-    """Pick `count` FX files, shuffling to avoid immediate repeats.
-
-    If `count` exceeds the pool, the shuffled pool repeats (reshuffled each
-    cycle) so we still never play the same FX twice back-to-back.
-    """
+def _iter_fx_picks(fx_files: list[str]):
+    """Yield paths from `fx_files` forever, shuffling to avoid back-to-back repeats."""
     if not fx_files:
-        return []
-    picks: list[str] = []
+        return
+    last: str | None = None
     pool: list[str] = []
-    while len(picks) < count:
+    while True:
         if not pool:
             pool = list(fx_files)
             random.shuffle(pool)
-            if picks and pool[0] == picks[-1] and len(pool) > 1:
+            if last is not None and len(pool) > 1 and pool[0] == last:
                 pool[0], pool[1] = pool[1], pool[0]
-        picks.append(pool.pop(0))
-    return picks
+        nxt = pool.pop(0)
+        last = nxt
+        yield nxt
 
 
 def _passthrough(input_video: str, output_path: str) -> str:
@@ -191,9 +397,11 @@ def add_fx_sounds(video_path: str, tmp_dir: str | None = None) -> str:
 
     moments = _load_moments(base, tmp_dir)
     if not moments:
+        gate = stem_for_editor_gate(base)
         print(
             "[08d] No AI zoom moments found "
-            f"(.tmp/{base}_zoom_moments.json missing or empty); passing audio through."
+            f"(no .tmp/*_zoom_moments.json for editor-gate base {gate!r}; "
+            "see 08b); passing audio through."
         )
         return _passthrough(input_video, output_path)
 
@@ -202,13 +410,42 @@ def add_fx_sounds(video_path: str, tmp_dir: str | None = None) -> str:
         print(f"[08d] No FX files found in '{fx_root}/'; passing audio through.")
         return _passthrough(input_video, output_path)
 
-    picks = _pick_fx_cycle(fx_files, len(moments))
-    assignments = list(zip(moments, picks))
+    gate = stem_for_editor_gate(base)
+    transcript_segments = _load_transcript_segments(gate, tmp_dir)
+    keyword_rules = _load_fx_keyword_rules(fx_root)
+    by_base = _index_fx_by_basename(fx_files)
+    if keyword_rules:
+        print(
+            f"[08d] Keyword FX map: {len(keyword_rules)} rule(s) "
+            f"({_fx_keyword_map_path(fx_root)!r})"
+        )
+
+    fx_fallback = _iter_fx_picks(fx_files)
+    assignments: list[tuple[dict, str, str]] = []
+    for moment in moments:
+        end = moment.get("end")
+        overlap = _moment_overlap_text(
+            float(moment["start"]),
+            float(end) if isinstance(end, (int, float)) else None,
+            transcript_segments,
+        )
+        reason = (moment.get("reason") or "").strip()
+        context = f"{reason} {overlap}".strip()
+        chosen = _match_keyword_fx(context, keyword_rules, fx_root, by_base)
+        if chosen:
+            tag = "keyword"
+        else:
+            chosen = next(fx_fallback)
+            tag = "random"
+        assignments.append((moment, chosen, tag))
 
     print(f"[08d] Overlaying {len(assignments)} FX sound(s) from '{fx_root}/'")
-    for moment, fx in assignments:
+    for moment, fx, tag in assignments:
         reason = f" — {moment['reason']}" if moment.get("reason") else ""
-        print(f"  {moment['start']:6.2f}s  ←  {os.path.basename(fx)}{reason}")
+        print(
+            f"  {moment['start']:6.2f}s  ←  {os.path.basename(fx)} "
+            f"[{tag}]{reason}"
+        )
 
     # Build an FFmpeg command that overlays each FX onto the original voice
     # track at its moment's timestamp. To guarantee the voice is NOT altered
@@ -217,7 +454,7 @@ def add_fx_sounds(video_path: str, tmp_dir: str | None = None) -> str:
     # shared format and then sum them explicitly via `amerge + pan` — the
     # same unity-gain pattern used by step 10 for background music.
     inputs: list[str] = ["-i", input_video]
-    for _, fx_path in assignments:
+    for _, fx_path, _ in assignments:
         inputs.extend(["-i", fx_path])
 
     # Match the input video's channel layout so the voice is preserved at
@@ -236,7 +473,7 @@ def add_fx_sounds(video_path: str, tmp_dir: str | None = None) -> str:
     filter_parts.append(f"[0:a]{fmt}[voice]")
 
     fx_labels: list[str] = []
-    for idx, (moment, _) in enumerate(assignments, start=1):
+    for idx, (moment, _, _tag) in enumerate(assignments, start=1):
         delay_ms = max(0, int(round(float(moment["start"]) * 1000)))
         label = f"fx{idx}"
         filter_parts.append(

@@ -23,10 +23,11 @@ from captacity import segment_parser
 from moviepy import CompositeVideoClip
 
 import env_paths
-from editor_gate import stem_for_editor_gate
+from editor_gate import read_overlay_title_for_base, stem_for_editor_gate
 from video_encoding import (
     build_color_preserving_composite_encode_args,
     build_moviepy_lossless_params,
+    ensure_mp4_aac_stereo_48k,
     first_existing_nonempty_video,
     source_color_normalize_filter,
 )
@@ -59,8 +60,9 @@ def _captacity_lossless_override(source_video: str):
     it calls MoviePy's `write_videofile`, which re-encodes the final output
     lossily and drops the source color tags. Patch the composite clip's write
     method so captacity emits the same lossless x264 export (crf 0, veryslow,
-    preserved colorspace/transfer/primaries/range, ALAC audio) used by the
-    other pipeline steps. Only used by the captacity fallback path.
+    preserved colorspace/transfer/primaries/range, AAC audio for mobile MP4
+    compatibility) used by the Remotion path. Only used by the captacity
+    fallback path.
     """
     original_write = CompositeVideoClip.write_videofile
     lossless_params = build_moviepy_lossless_params(source_video)
@@ -68,12 +70,11 @@ def _captacity_lossless_override(source_video: str):
     def patched_write(self, filename, *args, **kwargs):
         kwargs["codec"] = "libx264"
         kwargs["preset"] = "veryslow"
-        kwargs["audio_codec"] = "alac"
+        kwargs["audio_codec"] = "aac"
+        kwargs["audio_bitrate"] = "192k"
         kwargs.pop("bitrate", None)
         kwargs["ffmpeg_params"] = list(lossless_params)
-        # MoviePy's extensions_dict has no entry for ALAC, so find_extension()
-        # raises when it tries to derive a temp audio filename. Provide an
-        # explicit .m4a temp path (ALAC's native container) to bypass lookup.
+        # Explicit .m4a temp path for reliable AAC muxing with MoviePy.
         base, _ = os.path.splitext(filename)
         kwargs.setdefault("temp_audiofile", f"{base}_captacityTEMP_audio.m4a")
         return original_write(self, filename, *args, **kwargs)
@@ -254,9 +255,10 @@ def _composite_overlay_with_ffmpeg(
 ) -> None:
     """
     Overlay the transparent caption track (ProRes 4444 w/ alpha) onto the
-    untouched source video in a single FFmpeg pass. Audio is stream-copied
-    from the source; video is re-encoded with the same libx264 + color
-    normalization as step 08c (not VideoToolbox), so the exported final
+    untouched source video in a single FFmpeg pass. Audio is re-encoded to
+    AAC-LC so phones and in-app players decode MP4 reliably (ALAC from upstream
+    would often play on desktop only). Video is re-encoded with the same libx264
+    + color normalization as step 08c (not VideoToolbox), so the exported final
     matches the b-roll composite's color and quality.
     """
     src_vf = source_color_normalize_filter(source_video)
@@ -271,7 +273,10 @@ def _composite_overlay_with_ffmpeg(
         "-map", "0:a?",
         "-map_metadata", "0",
         *encode_args,
-        "-c:a", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "48000",
+        "-ac", "2",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -286,6 +291,7 @@ def _render_with_remotion(
     output_path: str,
     tmp_dir: str,
     base: str,
+    overlay_title: str = "",
 ) -> None:
     """
     Two-stage render that bypasses the slowest part of the old approach
@@ -295,7 +301,7 @@ def _render_with_remotion(
        4444 .mov with alpha. Chrome paints nearly-empty frames, so this is
        ~10x faster than compositing the whole video in-browser.
     2. FFmpeg overlays the caption track on the untouched source video in
-       a single pass (audio stream-copied, video re-encoded with the
+       a single pass (audio re-encoded to AAC for mobile, video re-encoded with the
        same libx264 + color normalization as the b-roll composite pass).
        Because the main video's pixels are never decoded by Chrome,
        there is no quality loss on the source.
@@ -325,6 +331,7 @@ def _render_with_remotion(
         "yFromBottom": max(0, y_from_bottom),
         "padding": PADDING,
         "renderMainVideo": False,
+        "overlayTitle": (overlay_title or "").strip(),
     }
 
     props_path = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions.props.json"))
@@ -417,8 +424,12 @@ def add_captions(
     raw_stem = os.path.splitext(os.path.basename(video_path))[0]
     base = stem_for_editor_gate(raw_stem)
 
-    # Resolve input video (skip empty/corrupt intermediates)
-    candidates = [
+    # Resolve input video. `run_pipeline` passes the *actual* previous step output
+    # (e.g. …_fx.mp4 when 08e is off). Prefer that over a fixed priority list: an
+    # old …_dataviz.mp4 on disk would otherwise win and captions would not match
+    # the last pipeline artifact. For bare .tmp/{base}.mp4 (e.g. --only 09), keep
+    # scanning the chain Newest→oldest.
+    chain_candidates = [
         os.path.join(tmp_dir, f"{base}_dataviz.mp4"),
         os.path.join(tmp_dir, f"{base}_fx.mp4"),
         os.path.join(tmp_dir, f"{base}_broll.mp4"),
@@ -429,7 +440,16 @@ def add_captions(
         os.path.join(tmp_dir, f"{base}_studio.mp4"),
         video_path,
     ]
-    input_video = first_existing_nonempty_video(candidates)
+    vp_abs = os.path.abspath(video_path)
+    if (
+        raw_stem != base
+        and os.path.isfile(vp_abs)
+        and os.path.getsize(vp_abs) > 0
+    ):
+        # Pipeline (or manual) path points at a suffixed intermediate — trust it.
+        input_video = vp_abs
+    else:
+        input_video = first_existing_nonempty_video(chain_candidates)
     if not input_video:
         raise RuntimeError("[09] No readable input video found")
 
@@ -461,11 +481,21 @@ def add_captions(
     print(f"[09] Video geometry: {geometry['width']}x{geometry['height']} "
           f"@ {geometry['fps']:.3f}fps, {geometry['duration']:.2f}s")
 
+    overlay_title = read_overlay_title_for_base(base, tmp_dir)
+    if overlay_title:
+        preview = overlay_title if len(overlay_title) <= 72 else overlay_title[:69] + "…"
+        print(f"[09] Top title from editor: {preview!r}")
+
     use_remotion = (
         os.environ.get("CAPTIONS_USE_REMOTION", "1").strip().lower() in {"1", "true", "yes"}
         if USE_REMOTION_DEFAULT
         else os.environ.get("CAPTIONS_USE_REMOTION", "").strip().lower() in {"1", "true", "yes"}
     )
+
+    def _finish_output() -> str:
+        ensure_mp4_aac_stereo_48k(output_path)
+        print(f"[09] Final output: {output_path}")
+        return output_path
 
     if use_remotion and segments and _remotion_available():
         try:
@@ -485,9 +515,9 @@ def add_captions(
                 output_path=output_path,
                 tmp_dir=tmp_dir,
                 base=base,
+                overlay_title=overlay_title,
             )
-            print(f"[09] Final output: {output_path}")
-            return output_path
+            return _finish_output()
         except subprocess.CalledProcessError as exc:
             print(f"[09] Remotion render failed (exit {exc.returncode}), "
                   f"falling back to captacity...")
@@ -500,14 +530,18 @@ def add_captions(
         print("[09] No sanitized transcript available, using captacity fallback "
               "so it can transcribe from scratch.")
 
+    if overlay_title:
+        print(
+            "[09] Top title is Remotion-only; captacity fallback does not burn it in."
+        )
+
     _render_with_captacity(
         input_video=input_video,
         segments=segments,
         geometry=geometry,
         output_path=output_path,
     )
-    print(f"[09] Final output: {output_path}")
-    return output_path
+    return _finish_output()
 
 
 def _build_test_video(tmp_dir: str | None = None, duration: float = 5.0) -> str:

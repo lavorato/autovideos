@@ -705,6 +705,7 @@ def list_editable_files(tmp_dir: str | None = None) -> list[dict[str, Any]]:
         slot["editor_review"] = editor_gate.is_editor_review_complete_for_base(
             slot["base"], tmp_dir
         )
+        slot["overlay_title"] = editor_gate.read_overlay_title_for_base(slot["base"], tmp_dir)
     return out
 
 
@@ -1084,6 +1085,42 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 700;
       color: var(--muted);
       min-width: 7.5em;
+    }
+    .group .group-overlay-title {
+      padding: 8px 12px 10px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(24, 86, 255, 0.04);
+    }
+    .group .group-overlay-title label {
+      display: block;
+      font-size: 10px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .group .group-overlay-title textarea.overlay-title-input {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 52px;
+      resize: vertical;
+      font-size: 12px;
+      line-height: 1.35;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--glass-strong);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    .group .group-overlay-title textarea.overlay-title-input::placeholder {
+      color: var(--muted);
+      opacity: 0.85;
+    }
+    .group .group-overlay-title textarea.overlay-title-input:focus {
+      outline: none;
+      border-color: rgba(24, 86, 255, 0.45);
+      box-shadow: 0 0 0 2px rgba(24, 86, 255, 0.12);
     }
     .group .row {
       display: flex; align-items: center; gap: 10px;
@@ -1802,6 +1839,13 @@ INDEX_HTML = r"""<!doctype html>
             <div class="gate-row"><span class="gate-label">1 · Trim</span>${trimOk}${reviewHint}</div>
             <div class="gate-row"><span class="gate-label">2 · Transcript</span>${reviewOk}<span class="hint">Then <code>--skip 00,01</code></span></div>
           </div>`;
+        const titleVal = escapeHtml(g.overlay_title || "");
+        const titleBox = `
+          <div class="group-overlay-title">
+            <label for="ot-${escapeHtml(g.base)}">Top title (step 09 / Remotion)</label>
+            <textarea id="ot-${escapeHtml(g.base)}" class="overlay-title-input" data-base="${escapeHtml(g.base)}"
+              rows="2" placeholder="Optional — white box, black type, full duration">${titleVal}</textarea>
+          </div>`;
         const hasVideo = !!g.video;
         const run02BtnTitle = hasVideo
           ? "Run steps 02+ (skips 00 and 01). Same as: python execution/run_pipeline.py .tmp/NAME.mp4 with only post-01 steps. Respects editor gates. Watch the terminal for logs."
@@ -1816,9 +1860,40 @@ INDEX_HTML = r"""<!doctype html>
                 ${hasVideo ? "" : "disabled"}>Run 02+</button>
             </div>
             ${gate}
+            ${titleBox}
             ${rows.join("")}
           </div>`;
       }).join("");
+
+      const overlayTitleTimers = {};
+      async function saveOverlayTitle(base, text) {
+        try {
+          const r = await fetch("/api/overlay-title", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ base, text }),
+          });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            toast("Title save failed: " + (data.error || r.statusText), "error");
+            return;
+          }
+        } catch (e) {
+          toast("Title save failed: " + e, "error");
+        }
+      }
+      host.querySelectorAll("textarea.overlay-title-input").forEach((ta) => {
+        ta.addEventListener("keydown", (ev) => { ev.stopPropagation(); });
+        ta.addEventListener("click", (ev) => { ev.stopPropagation(); });
+        ta.addEventListener("input", () => {
+          const base = ta.getAttribute("data-base");
+          if (!base) return;
+          clearTimeout(overlayTitleTimers[base]);
+          overlayTitleTimers[base] = setTimeout(() => {
+            saveOverlayTitle(base, ta.value);
+          }, 450);
+        });
+      });
 
       host.querySelectorAll(".row[data-path]").forEach((el) => {
         el.addEventListener("click", () => openFile(el.dataset.path));
@@ -2837,6 +2912,17 @@ def _build_handler(session: Session, output_dir: str):
 
             if path == "/api/close":
                 session.close()
+                self._send_json(200, {"ok": True}); return
+
+            if path == "/api/overlay-title":
+                base = str(body.get("base", "")).strip()
+                text = str(body.get("text", ""))
+                if not base:
+                    self._send_json(400, {"error": "missing base"}); return
+                try:
+                    editor_gate.write_overlay_title_for_base(base, text, session.tmp_dir)
+                except OSError as e:
+                    self._send_json(500, {"error": str(e)}); return
                 self._send_json(200, {"ok": True}); return
 
             if path == "/api/video/save":

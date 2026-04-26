@@ -50,6 +50,7 @@ type CaptionsProps = {
   yFromBottom: number;
   padding: number;
   renderMainVideo: boolean;
+  overlayTitle: string;
 };
 
 const defaultCaptionsProps: CaptionsProps = {
@@ -68,6 +69,7 @@ const defaultCaptionsProps: CaptionsProps = {
   yFromBottom: 1020,
   padding: 250,
   renderMainVideo: true,
+  overlayTitle: "",
 };
 
 const RemotionRoot = () => {

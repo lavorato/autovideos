@@ -210,6 +210,38 @@ def write_trim_confirm_complete(video_path: str, tmp_dir: str | None = None) -> 
     return write_trim_confirm_for_base(stem_for_editor_gate(video_basename(video_path)), tmp_dir)
 
 
+def overlay_title_path_for_base(base: str, tmp_dir: str | None = None) -> str:
+    """Sidecar for optional top-of-frame title burned in during step 09 (Remotion)."""
+    d = _resolve_tmp_dir(tmp_dir)
+    return os.path.join(d, f"{base}_overlay_title.json")
+
+
+def read_overlay_title_for_base(base: str, tmp_dir: str | None = None) -> str:
+    p = overlay_title_path_for_base(base, tmp_dir)
+    if not os.path.isfile(p) or os.path.getsize(p) == 0:
+        return ""
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    t = data.get("text")
+    return str(t).strip() if t is not None else ""
+
+
+def write_overlay_title_for_base(base: str, text: str, tmp_dir: str | None = None) -> str:
+    """Persist title for captions overlay. ``text`` may be empty to clear."""
+    tmp_dir = _resolve_tmp_dir(tmp_dir)
+    out = overlay_title_path_for_base(base, tmp_dir)
+    os.makedirs(os.path.abspath(os.path.dirname(out) or "."), exist_ok=True)
+    payload: dict[str, Any] = {"text": str(text or "").strip()}
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return out
+
+
 def resolve_base_from_cli_arg(arg: str) -> str:
     """Accept ``.tmp/IMG.mp4``, ``IMG_transcript.json``, or bare ``IMG``."""
     bn = os.path.basename(arg.strip().rstrip("/"))

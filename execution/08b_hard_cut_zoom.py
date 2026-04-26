@@ -544,7 +544,10 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str | None = None) -> str:
 
     # Persist AI moments (or empty list) so downstream steps — e.g. 08d FX
     # sounds — know where the impactful beats are without re-querying the LLM.
-    moments_path = os.path.join(tmp_dir, f"{base}_zoom_moments.json")
+    # Use editor-gate stem so the sidecar path matches 08d regardless of which
+    # intermediate (…_broll, …_voice, …) is current.
+    moments_stem = stem_for_editor_gate(base)
+    moments_path = os.path.join(tmp_dir, f"{moments_stem}_zoom_moments.json")
     try:
         os.makedirs(tmp_dir, exist_ok=True)
         with open(moments_path, "w", encoding="utf-8") as f:

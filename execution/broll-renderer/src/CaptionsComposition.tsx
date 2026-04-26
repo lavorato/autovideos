@@ -35,6 +35,11 @@ export type CaptionsProps = {
   yFromBottom: number;
   padding: number;
   /**
+   * Optional Instagram-style top banner: white rounded box, black bold text,
+   * shown for the full composition duration (burned in during step 09).
+   */
+  overlayTitle?: string;
+  /**
    * When true (default), the composition renders the source video as a
    * full-bleed background via <OffthreadVideo>. When false, the background
    * is transparent and only the caption text is painted — used by the
@@ -77,6 +82,54 @@ const useCaptionFont = (fontSrc: string) => {
       cancelled = true;
     };
   }, [fontSrc, handle]);
+};
+
+const TopTitlePill: React.FC<{ text: string }> = ({ text }) => {
+  const trimmed = text.trim();
+  const { width, height } = useVideoConfig();
+  if (!trimmed) {
+    return null;
+  }
+  const fontSize = Math.round(Math.min(44, Math.max(24, width * 0.034)));
+  const padV = Math.round(fontSize * 0.55);
+  const padH = Math.round(fontSize * 0.72);
+  const sideInset = Math.round(Math.max(28, width * 0.045));
+  const top = Math.round(Math.max(36, height * 0.022));
+  const radius = Math.round(Math.min(36, width * 0.026));
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: sideInset,
+        right: sideInset,
+        top,
+        display: "flex",
+        justifyContent: "center",
+        pointerEvents: "none",
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: "#ffffff",
+          color: "#000000",
+          fontFamily: `${FONT_FAMILY}, system-ui, sans-serif`,
+          fontWeight: 700,
+          fontSize,
+          lineHeight: 1.28,
+          textAlign: "center",
+          padding: `${padV}px ${padH}px`,
+          borderRadius: radius,
+          maxWidth: "100%",
+          boxSizing: "border-box",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        {trimmed}
+      </div>
+    </div>
+  );
 };
 
 type CaptionLineProps = {
@@ -191,6 +244,9 @@ const CaptionLine: React.FC<CaptionLineProps> = ({
 
 const MAX_WORDS_PER_LINE = 3;
 
+/** How long the top title pill stays on screen (matches typical hook length). */
+const OVERLAY_TITLE_DURATION_SEC = 5;
+
 /**
  * Split a caption into sub-captions of at most MAX_WORDS_PER_LINE words.
  * Each chunk keeps the original word timings, but its `start`/`end` are
@@ -232,6 +288,7 @@ export const CaptionsComposition: React.FC<CaptionsProps> = ({
   shadowBlurPx,
   yFromBottom,
   padding,
+  overlayTitle = "",
   renderMainVideo = true,
 }) => {
   useCaptionFont(fontSrc);
@@ -252,6 +309,17 @@ export const CaptionsComposition: React.FC<CaptionsProps> = ({
     <AbsoluteFill style={{ backgroundColor }}>
       {renderMainVideo && mainVideoSrc ? (
         <OffthreadVideo src={staticFile(mainVideoSrc)} />
+      ) : null}
+      {overlayTitle.trim() ? (
+        <Sequence
+          from={0}
+          durationInFrames={Math.max(
+            1,
+            Math.round(OVERLAY_TITLE_DURATION_SEC * fps),
+          )}
+        >
+          <TopTitlePill text={overlayTitle} />
+        </Sequence>
       ) : null}
       {chunkedCaptions.map((caption, i) => {
         const from = Math.max(0, Math.round(caption.start * fps));
