@@ -26,9 +26,11 @@ Behavior:
     - Output: .tmp/{base}.mp4  (same base as the source → downstream tmp paths
       like .tmp/{base}_transcript.json remain unchanged)
     - Reuses an existing non-empty output (fast re-runs).
-    - Resolution: the long edge is capped at 1920 while preserving aspect
-      ratio (landscape -> up to 1920x1080, portrait -> up to 1080x1920).
-      Smaller sources are never upscaled.
+    - Resolution: output is normalized to 1920x1080 (landscape or square) or
+      1080x1920 (portrait), preserving aspect with letter/pillar padding.
+      Sources below that frame are upscaled; larger sources are scaled down
+      to fit. The long-edge cap SOURCE_MAX_LONG_EDGE (default 1920) only
+      affects when we skip the copy path for non-heavy files (unchanged).
     - Audio: re-encoded to AAC 256k (transparent for speech) to guarantee
       MP4 container compatibility regardless of source codec.
 
@@ -52,6 +54,11 @@ from video_encoding import build_fast_hq_x264_args
 
 
 HEAVY_EXTENSIONS = {".mov", ".mkv", ".avi"}
+
+# Standard HD working frame (landscape / portrait). Undersized sources are
+# upscaled; larger sources are fit inside with pad.
+TARGET_LW, TARGET_LH = 1920, 1080
+TARGET_PW, TARGET_PH = 1080, 1920
 
 
 def _size_mb(path: str) -> float:
@@ -85,6 +92,29 @@ def _probe_dimensions(video_path: str) -> tuple[int, int]:
     return (int(streams[0].get("width") or 0), int(streams[0].get("height") or 0))
 
 
+def _is_undersized_hd(width: int, height: int) -> bool:
+    """True if the frame is smaller than the pipeline HD target (upscale)."""
+    if width <= 0 or height <= 0:
+        return False
+    if width >= height:
+        return width < TARGET_LW or height < TARGET_LH
+    return width < TARGET_PW or height < TARGET_PH
+
+
+def _fit_hd_scale_filter(width: int, height: int) -> str:
+    """
+    scale + pad to 1920x1080 (landscape) or 1080x1920 (portrait), aspect preserved.
+    """
+    if width >= height:
+        tw, th = TARGET_LW, TARGET_LH
+    else:
+        tw, th = TARGET_PW, TARGET_PH
+    return (
+        f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
+
+
 def convert_source(video_path: str, tmp_dir: str | None = None) -> str:
     if tmp_dir is None:
         tmp_dir = env_paths.tmp_dir()
@@ -114,9 +144,10 @@ def convert_source(video_path: str, tmp_dir: str | None = None) -> str:
     width, height = _probe_dimensions(video_path)
     long_edge = max(width, height)
     oversized = long_edge > max_long_edge
+    undersized = _is_undersized_hd(width, height)
     is_heavy = ext in HEAVY_EXTENSIONS
 
-    if not is_heavy and not oversized:
+    if not is_heavy and not oversized and not undersized:
         if long_edge:
             print(
                 f"[00] Source is {ext or 'unknown'} at {width}x{height} "
@@ -133,23 +164,23 @@ def convert_source(video_path: str, tmp_dir: str | None = None) -> str:
     in_mb = _size_mb(video_path)
     crf = int(os.getenv("SOURCE_TRANSCODE_CRF", "20"))
     preset = os.getenv("SOURCE_TRANSCODE_PRESET", "veryfast")
-    reason = "heavy format" if is_heavy else f"oversized ({long_edge}px > {max_long_edge}px)"
+    if is_heavy:
+        reason = "heavy format"
+    elif oversized and undersized:
+        reason = f"size adjust ({width}x{height}, long edge {long_edge}px vs {max_long_edge}px)"
+    elif oversized:
+        reason = f"oversized ({long_edge}px > {max_long_edge}px)"
+    else:
+        out_frame = f"{TARGET_LW}x{TARGET_LH}" if width >= height else f"{TARGET_PW}x{TARGET_PH}"
+        reason = f"below HD target ({width}x{height} -> {out_frame})"
     print(
         f"[00] Transcoding source ({reason}) for faster pipeline processing: {video_path} "
         f"({in_mb:.1f} MB, {width}x{height}) -> libx264 preset={preset} crf={crf}"
     )
 
     video_args = build_fast_hq_x264_args(video_path, crf=crf, preset=preset)
-    # Cap the long edge at max_long_edge so landscape sources become at most
-    # {cap}x{cap*9/16} and portrait sources at most {cap*9/16}x{cap}. Aspect
-    # ratio is preserved and smaller videos are never upscaled (min(...) keeps
-    # the original dimension when already smaller). -2 lets ffmpeg auto-compute
-    # the other dimension while keeping it divisible by 2 (required by yuv420p).
-    scale_filter = (
-        "scale="
-        f"'if(gt(iw,ih),min({max_long_edge},iw),-2)':"
-        f"'if(gt(iw,ih),-2,min({max_long_edge},ih))'"
-    )
+    # Normalize to 1920x1080 or 1080x1920 (upscale if undersized, downscale if larger).
+    scale_filter = _fit_hd_scale_filter(width, height)
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
         "-i", video_path,

@@ -3,6 +3,7 @@ import { BrollComposition, type BrollSegment } from "./BrollComposition";
 import {
   CaptionsComposition,
   type Caption,
+  type FaceBandNorm,
 } from "./CaptionsComposition";
 
 /**
@@ -51,6 +52,9 @@ type CaptionsProps = {
   padding: number;
   renderMainVideo: boolean;
   overlayTitle: string;
+  titlePillEdge: "top" | "bottom";
+  faceBandNormIntro: FaceBandNorm | null;
+  faceCxNormIntro: number | null;
 };
 
 const defaultCaptionsProps: CaptionsProps = {
@@ -70,6 +74,9 @@ const defaultCaptionsProps: CaptionsProps = {
   padding: 250,
   renderMainVideo: true,
   overlayTitle: "",
+  titlePillEdge: "top",
+  faceBandNormIntro: null,
+  faceCxNormIntro: null,
 };
 
 const RemotionRoot = () => {

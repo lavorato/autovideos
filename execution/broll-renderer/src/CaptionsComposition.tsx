@@ -23,6 +23,9 @@ export type Caption = {
   words: CaptionWord[];
 };
 
+/** Normalized vertical extent of the face (0 = top, 1 = bottom), from Haar bbox. */
+export type FaceBandNorm = { y0: number; y1: number };
+
 export type CaptionsProps = {
   mainVideoSrc: string;
   fontSrc: string;
@@ -39,6 +42,19 @@ export type CaptionsProps = {
    * shown for the full composition duration (burned in during step 09).
    */
   overlayTitle?: string;
+  /**
+   * Fallback when `faceBandNormIntro` is absent: "top" pins near the top;
+   * "bottom" stacks just above the caption line.
+   */
+  titlePillEdge?: "top" | "bottom";
+  /**
+   * Face vertical band from `_face_positions.json` (Haar y0/y1 in the title
+   * window). When set, the pill avoids this rectangle; bbox data fixes
+   * close-ups where mean cy underestimated face height.
+   */
+  faceBandNormIntro?: FaceBandNorm | null;
+  /** Mean face center X (0=left, 1=right) in the title window — nudges the pill sideways. */
+  faceCxNormIntro?: number | null;
   /**
    * When true (default), the composition renders the source video as a
    * full-bleed background via <OffthreadVideo>. When false, the background
@@ -84,17 +100,155 @@ const useCaptionFont = (fontSrc: string) => {
   }, [fontSrc, handle]);
 };
 
-const TopTitlePill: React.FC<{ text: string }> = ({ text }) => {
+/** Match pill metrics for overlap checks vs rendered box. */
+const estimateTitlePillBoxPx = (width: number) => {
+  const fontSize = Math.round(Math.min(44, Math.max(24, width * 0.034)));
+  const padV = Math.round(fontSize * 0.55);
+  const pillH = Math.round(fontSize * 1.28 + padV * 2);
+  return { fontSize, padV, padH: Math.round(fontSize * 0.72), pillH };
+};
+
+/** Height budget for layout (wrapped titles, line height slack). */
+const titlePillLayoutHeightPx = (width: number) => {
+  const { pillH: basePillH } = estimateTitlePillBoxPx(width);
+  return basePillH + Math.round(32 + Math.min(48, width * 0.028));
+};
+
+const clamp = (n: number, lo: number, hi: number) =>
+  Math.max(lo, Math.min(hi, n));
+
+type TitlePillVertical =
+  | { anchor: "top"; topPx: number }
+  | { anchor: "bottom"; bottomStackPx: number };
+
+/**
+ * Place the title pill near the vertical middle of the frame while staying out
+ * of the face band and above captions. Horizontal nudge uses cx separately.
+ */
+const layoutTitlePillMiddleAvoidFace = (args: {
+  width: number;
+  height: number;
+  yFromBottom: number;
+  captionFontSize: number;
+  bandY0: number;
+  bandY1: number;
+  fallbackEdge: "top" | "bottom";
+}): TitlePillVertical => {
+  const pillH = titlePillLayoutHeightPx(args.width);
+  const { fontSize, padV } = estimateTitlePillBoxPx(args.width);
+  const minTop = Math.max(36, Math.round(args.height * 0.022));
+  const margin = 14;
+  const faceTop = args.bandY0 * args.height;
+  const faceBottom = args.bandY1 * args.height;
+  const captionTop =
+    args.height - args.yFromBottom - Math.round(args.captionFontSize * 1.25);
+  const maxTop = Math.max(minTop, captionTop - pillH - margin);
+  const idealTop = Math.round(args.height / 2 - pillH / 2);
+
+  const pillOverlapsFace = (topPx: number) => {
+    const y0 = topPx;
+    const y1 = topPx + pillH;
+    return y1 > faceTop - margin && y0 < faceBottom + margin;
+  };
+
+  const defaultBottomStack = Math.round(
+    args.yFromBottom + Math.max(56, fontSize * 1.75 + padV * 2),
+  );
+
+  const intervals: Array<[number, number]> = [];
+  const upperHi = Math.min(maxTop, Math.floor(faceTop - margin - pillH));
+  if (upperHi >= minTop) {
+    intervals.push([minTop, upperHi]);
+  }
+  const lowerLo = Math.ceil(faceBottom + margin);
+  if (maxTop >= lowerLo) {
+    intervals.push([Math.max(minTop, lowerLo), maxTop]);
+  }
+
+  let bestTop: number | null = null;
+  let bestDist = Infinity;
+  const frameMid = args.height / 2;
+  for (const [lo, hi] of intervals) {
+    if (hi < lo) {
+      continue;
+    }
+    const cand = clamp(idealTop, lo, hi);
+    const dist = Math.abs(cand + pillH / 2 - frameMid);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestTop = cand;
+    }
+  }
+
+  if (bestTop != null && !pillOverlapsFace(bestTop)) {
+    return { anchor: "top", topPx: bestTop };
+  }
+
+  const scattered = [
+    idealTop,
+    minTop,
+    maxTop,
+    Math.round(faceBottom + margin),
+    Math.round((minTop + maxTop) / 2),
+  ];
+  for (const c of scattered) {
+    const t = clamp(c, minTop, maxTop);
+    if (!pillOverlapsFace(t)) {
+      const d = Math.abs(t + pillH / 2 - frameMid);
+      if (d < bestDist) {
+        bestDist = d;
+        bestTop = t;
+      }
+    }
+  }
+
+  if (bestTop != null) {
+    return { anchor: "top", topPx: bestTop };
+  }
+
+  let bs = defaultBottomStack;
+  const maxBs = args.height - minTop - pillH;
+  while (bs <= maxBs) {
+    const y0 = args.height - bs - pillH;
+    const y1 = args.height - bs;
+    const overlaps =
+      y1 > faceTop - margin && y0 < faceBottom + margin;
+    if (!overlaps && y1 <= captionTop - margin) {
+      return { anchor: "bottom", bottomStackPx: bs };
+    }
+    bs += 28;
+  }
+
+  if (args.fallbackEdge === "bottom") {
+    return { anchor: "bottom", bottomStackPx: defaultBottomStack };
+  }
+  return { anchor: "top", topPx: clamp(idealTop, minTop, maxTop) };
+};
+
+/** Shift pill horizontally away from face center (normalized cx, 0=left). */
+const titleNudgeXFromFaceCx = (
+  cx: number | null | undefined,
+  width: number,
+): number => {
+  if (cx == null || !Number.isFinite(cx) || cx < 0 || cx > 1) {
+    return 0;
+  }
+  const maxNudge = Math.min(100, Math.round(width * 0.14));
+  return Math.round((0.5 - cx) * 2 * maxNudge);
+};
+
+const TopTitlePill: React.FC<{
+  text: string;
+  vertical: TitlePillVertical;
+  width: number;
+  nudgeXPx?: number;
+}> = ({ text, vertical, width, nudgeXPx = 0 }) => {
   const trimmed = text.trim();
-  const { width, height } = useVideoConfig();
   if (!trimmed) {
     return null;
   }
-  const fontSize = Math.round(Math.min(44, Math.max(24, width * 0.034)));
-  const padV = Math.round(fontSize * 0.55);
-  const padH = Math.round(fontSize * 0.72);
+  const { fontSize, padV, padH } = estimateTitlePillBoxPx(width);
   const sideInset = Math.round(Math.max(28, width * 0.045));
-  const top = Math.round(Math.max(36, height * 0.022));
   const radius = Math.round(Math.min(36, width * 0.026));
 
   return (
@@ -103,10 +257,13 @@ const TopTitlePill: React.FC<{ text: string }> = ({ text }) => {
         position: "absolute",
         left: sideInset,
         right: sideInset,
-        top,
+        ...(vertical.anchor === "top"
+          ? { top: vertical.topPx }
+          : { bottom: vertical.bottomStackPx }),
         display: "flex",
         justifyContent: "center",
         pointerEvents: "none",
+        transform: nudgeXPx ? `translateX(${nudgeXPx}px)` : undefined,
       }}
     >
       <div
@@ -289,10 +446,63 @@ export const CaptionsComposition: React.FC<CaptionsProps> = ({
   yFromBottom,
   padding,
   overlayTitle = "",
+  titlePillEdge = "top",
+  faceBandNormIntro = null,
+  faceCxNormIntro = null,
   renderMainVideo = true,
 }) => {
   useCaptionFont(fontSrc);
-  const { fps } = useVideoConfig();
+  const { fps, width, height } = useVideoConfig();
+
+  const titlePillVertical = useMemo((): TitlePillVertical => {
+    const { fontSize: pFont, padV } = estimateTitlePillBoxPx(width);
+    const minTop = Math.max(36, Math.round(height * 0.022));
+    const defaultBottomStack = Math.round(
+      yFromBottom + Math.max(56, pFont * 1.75 + padV * 2),
+    );
+    const pillH = titlePillLayoutHeightPx(width);
+    const margin = 14;
+    const captionTop =
+      height - yFromBottom - Math.round(fontSize * 1.25);
+    const maxTop = Math.max(minTop, captionTop - pillH - margin);
+    const idealTop = Math.round(height / 2 - pillH / 2);
+
+    const band = faceBandNormIntro;
+    if (
+      band != null &&
+      Number.isFinite(band.y0) &&
+      Number.isFinite(band.y1) &&
+      band.y0 >= 0 &&
+      band.y1 <= 1 &&
+      band.y1 > band.y0
+    ) {
+      return layoutTitlePillMiddleAvoidFace({
+        width,
+        height,
+        yFromBottom,
+        captionFontSize: fontSize,
+        bandY0: band.y0,
+        bandY1: band.y1,
+        fallbackEdge: titlePillEdge === "bottom" ? "bottom" : "top",
+      });
+    }
+    if (titlePillEdge === "bottom") {
+      return { anchor: "bottom", bottomStackPx: defaultBottomStack };
+    }
+    return { anchor: "top", topPx: clamp(idealTop, minTop, maxTop) };
+  }, [
+    faceBandNormIntro,
+    titlePillEdge,
+    fontSize,
+    height,
+    width,
+    yFromBottom,
+  ]);
+
+  const titlePillNudgeX = useMemo(
+    () => titleNudgeXFromFaceCx(faceCxNormIntro, width),
+    [faceCxNormIntro, width],
+  );
 
   // Overlay-only mode: transparent background + no video decode. The Python
   // side composites the resulting alpha track over the untouched source via
@@ -318,7 +528,12 @@ export const CaptionsComposition: React.FC<CaptionsProps> = ({
             Math.round(OVERLAY_TITLE_DURATION_SEC * fps),
           )}
         >
-          <TopTitlePill text={overlayTitle} />
+          <TopTitlePill
+            text={overlayTitle}
+            vertical={titlePillVertical}
+            width={width}
+            nudgeXPx={titlePillNudgeX}
+          />
         </Sequence>
       ) : null}
       {chunkedCaptions.map((caption, i) => {

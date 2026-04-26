@@ -22,8 +22,8 @@ FILLER_WORDS = {
     "éh", "eh", "ah", "uhm", "um", "hm", "ahn", "uh", "né"
 }
 
-MIN_PAUSE_KEEP = 0.6   # seconds - keep pauses shorter than this
-MAX_SILENCE_GAP = 1.5  # seconds - trim silences longer than this
+MIN_PAUSE_KEEP = 0.5   # seconds - keep pauses shorter than this
+MAX_SILENCE_GAP = 1.0  # seconds - trim silences longer than this
 
 
 def detect_fillers_and_gaps(words: list) -> list:

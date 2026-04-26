@@ -27,6 +27,7 @@ from editor_gate import stem_for_editor_gate
 from openrouter_client import chat_completion, has_openrouter_api_key, parse_models_from_env
 import env_paths
 from video_encoding import build_fast_pipeline_encode_args
+from face_positions_io import face_positions_json_path, write_face_positions_json
 
 # --- Config ---
 CUT_INTERVAL = 5.0       # seconds between each hard cut (fallback when no AI moments)
@@ -94,13 +95,23 @@ def detect_face_positions(video_path: str, sample_fps: float = FACE_SAMPLE_FPS) 
             faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
 
             cx, cy = 0.5, 0.5
+            y0, y1 = None, None
             if len(faces) > 0:
                 largest = max(faces, key=lambda f: f[2] * f[3])
                 fx, fy, fw, fh = largest
-                cx = (fx + fw / 2) / gray.shape[1]
-                cy = (fy + fh / 2) / gray.shape[0]
+                gh, gw = gray.shape[0], gray.shape[1]
+                cx = (fx + fw / 2) / gw
+                cy = (fy + fh / 2) / gh
+                y0 = float(fy / gh)
+                y1 = float((fy + fh) / gh)
 
-            positions.append({"time": t, "cx": float(cx), "cy": float(cy)})
+            positions.append({
+                "time": t,
+                "cx": float(cx),
+                "cy": float(cy),
+                "y0": y0,
+                "y1": y1,
+            })
         else:
             if not cap.grab():
                 break
@@ -149,9 +160,17 @@ def smooth_positions(positions: list, window: int = 7) -> list:
     for i in range(len(positions)):
         start = max(0, i - window // 2)
         end = min(len(positions), i + window // 2 + 1)
-        avg_cx = np.mean([p["cx"] for p in positions[start:end]])
-        avg_cy = np.mean([p["cy"] for p in positions[start:end]])
-        smoothed.append({"time": positions[i]["time"], "cx": avg_cx, "cy": avg_cy})
+        chunk = positions[start:end]
+        avg_cx = np.mean([p["cx"] for p in chunk])
+        avg_cy = np.mean([p["cy"] for p in chunk])
+        y0s = [p["y0"] for p in chunk if p.get("y0") is not None]
+        y1s = [p["y1"] for p in chunk if p.get("y1") is not None]
+        row = {"time": positions[i]["time"], "cx": float(avg_cx), "cy": float(avg_cy)}
+        if y0s:
+            row["y0"] = float(np.mean(y0s))
+        if y1s:
+            row["y1"] = float(np.mean(y1s))
+        smoothed.append(row)
     return smoothed
 
 
@@ -456,12 +475,42 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str | None = None) -> str:
 
     output_path = os.path.join(tmp_dir, f"{base}_hardcut.mp4")
 
-    positions, cv_width, cv_height, fps, first_frame_wh = detect_face_positions(input_video)
-    positions = smooth_positions(positions)
+    raw_samples, cv_width, cv_height, fps, first_frame_wh = detect_face_positions(input_video)
+    positions = smooth_positions(raw_samples)
 
     width, height, duration = probe_video_stream_size_duration(input_video)
     if duration <= 0:
         raise RuntimeError("[08b] Could not determine input video duration")
+
+    face_stem = stem_for_editor_gate(base)
+    face_json_path = face_positions_json_path(tmp_dir, face_stem)
+    try:
+        write_face_positions_json(
+            face_json_path,
+            {
+                "generator": "08b_hard_cut_zoom",
+                "input_basename": os.path.basename(input_video),
+                "face_sample_fps": FACE_SAMPLE_FPS,
+                "face_detect_max_dim": FACE_DETECT_MAX_DIM,
+                "opencv": {
+                    "width": cv_width,
+                    "height": cv_height,
+                    "fps": round(float(fps), 4),
+                    "first_frame_wh": list(first_frame_wh) if first_frame_wh else None,
+                },
+                "ffprobe": {
+                    "width": width,
+                    "height": height,
+                    "duration": round(float(duration), 4),
+                },
+                "samples": raw_samples,
+                "smoothed": positions,
+            },
+        )
+        print(f"[08b] Face positions JSON: {face_json_path}", flush=True)
+    except OSError as exc:
+        print(f"[08b] Could not write face positions sidecar: {exc}", flush=True)
+
     if first_frame_wh is not None:
         fw, fh = first_frame_wh
         if (fw, fh) != (width, height):
@@ -593,6 +642,9 @@ def apply_hard_cut_zoom(video_path: str, tmp_dir: str | None = None) -> str:
         if is_zoomed:
             cx, cy = get_face_at_time(positions, seg_start)
             segment_filter += zoom_crop_scale_ffmpeg(cx, cy, width, height, ZOOM_LEVEL)
+        # concat requires identical SAR on every branch; trim keeps source SAR (e.g. 1232:1233)
+        # while crop/scale can yield 1:1, which makes concat fail with EINVAL.
+        segment_filter += ",setsar=1"
         filter_parts.append(f"{segment_filter}[v{seg_idx}]")
 
     segment_count = len(segments_plan)

@@ -24,6 +24,7 @@ from moviepy import CompositeVideoClip
 
 import env_paths
 from editor_gate import read_overlay_title_for_base, stem_for_editor_gate
+from face_positions_io import face_positions_json_path, read_face_positions_json
 from video_encoding import (
     build_color_preserving_composite_encode_args,
     build_moviepy_lossless_params,
@@ -51,6 +52,9 @@ MARGIN_BOTTOM = 1020  # pixels from bottom edge
 REMOTION_DIR = os.path.join(os.path.dirname(__file__), "broll-renderer")
 REMOTION_COMPOSITION_ID = "CaptionsComposition"
 USE_REMOTION_DEFAULT = True
+
+# Must match `OVERLAY_TITLE_DURATION_SEC` in broll-renderer/CaptionsComposition.tsx
+_OVERLAY_TITLE_DURATION_SEC = 5.0
 
 
 @contextmanager
@@ -162,6 +166,81 @@ def _probe_video_geometry(video_path: str) -> dict:
         "width": int(stream.get("width") or 0),
         "height": int(stream.get("height") or 0),
         "duration": duration,
+    }
+
+
+# Extra normalized padding around Haar bbox so the pill clears hairline / chin.
+_FACE_BAND_PAD_TOP_NORM = 0.045
+_FACE_BAND_PAD_BOTTOM_NORM = 0.07
+# Legacy sidecars without y0/y1: generous band around mean cy (close-ups).
+_FACE_LEGACY_CY_HALF_SPAN = 0.36
+
+
+def _face_intro_band_norm_from_json(
+    tmp_dir: str,
+    editor_stem: str,
+    duration_sec: float,
+) -> dict[str, float] | None:
+    """
+    Vertical band (normalized 0=top, 1=bottom) covering the face in the title
+    window, from Haar bbox when present (steps 08/08b). Remotion avoids
+    placing the title pill in this band. Mean cy alone missed tall close-ups.
+    """
+    path = face_positions_json_path(tmp_dir, editor_stem)
+    if not os.path.isfile(path):
+        return None
+    try:
+        data = read_face_positions_json(path)
+    except (OSError, json.JSONDecodeError, TypeError, KeyError) as exc:
+        print(f"[09] Face positions JSON not usable ({path}): {exc}", flush=True)
+        return None
+    track = data.get("smoothed") or data.get("samples")
+    if not track:
+        return None
+    window = min(_OVERLAY_TITLE_DURATION_SEC, max(0.0, float(duration_sec or 0.0)))
+    if window <= 0:
+        return None
+    in_window = [s for s in track if 0.0 <= float(s.get("time", 0.0)) < window]
+    if not in_window:
+        in_window = track[: min(len(track), 64)]
+    if not in_window:
+        return None
+    avg_cy = sum(float(s.get("cy", 0.5)) for s in in_window) / len(in_window)
+    avg_cx = sum(float(s.get("cx", 0.5)) for s in in_window) / len(in_window)
+
+    y0s: list[float] = []
+    y1s: list[float] = []
+    for s in in_window:
+        y0 = s.get("y0")
+        y1 = s.get("y1")
+        if y0 is not None and y1 is not None:
+            try:
+                a, b = float(y0), float(y1)
+            except (TypeError, ValueError):
+                continue
+            if b > a:
+                y0s.append(a)
+                y1s.append(b)
+
+    if y0s and y1s:
+        band_y0 = max(0.0, min(y0s) - _FACE_BAND_PAD_TOP_NORM)
+        band_y1 = min(1.0, max(y1s) + _FACE_BAND_PAD_BOTTOM_NORM)
+        src = "bbox"
+    else:
+        band_y0 = max(0.0, float(avg_cy) - _FACE_LEGACY_CY_HALF_SPAN)
+        band_y1 = min(1.0, float(avg_cy) + _FACE_LEGACY_CY_HALF_SPAN)
+        src = "cy±legacy"
+
+    print(
+        f"[09] Title pill: face band y0..y1={band_y0:.3f}..{band_y1:.3f} "
+        f"(mean cx,cy={avg_cx:.3f},{avg_cy:.3f}, {src}, 0–{window:.1f}s)",
+        flush=True,
+    )
+    return {
+        "y0": band_y0,
+        "y1": band_y1,
+        "cy": float(avg_cy),
+        "cx": float(avg_cx),
     }
 
 
@@ -312,6 +391,15 @@ def _render_with_remotion(
 
     duration_frames = max(1, int(round(geometry["duration"] * geometry["fps"])))
     y_from_bottom = MARGIN_BOTTOM - (FONT_SIZE * LINE_COUNT)
+    face_band_intro = None
+    face_cx_intro = None
+    if (overlay_title or "").strip():
+        band_doc = _face_intro_band_norm_from_json(
+            tmp_dir, base, float(geometry.get("duration") or 0.0)
+        )
+        if band_doc:
+            face_band_intro = {"y0": band_doc["y0"], "y1": band_doc["y1"]}
+            face_cx_intro = float(band_doc["cx"])
 
     props = {
         "fps": int(round(geometry["fps"])),
@@ -332,6 +420,8 @@ def _render_with_remotion(
         "padding": PADDING,
         "renderMainVideo": False,
         "overlayTitle": (overlay_title or "").strip(),
+        "faceBandNormIntro": face_band_intro,
+        "faceCxNormIntro": face_cx_intro,
     }
 
     props_path = os.path.abspath(os.path.join(tmp_dir, f"{base}_captions.props.json"))

@@ -55,3 +55,17 @@ def fx_dir() -> str:
 
 def bgs_dir() -> str:
     return _resolve("VIDEOS_BGS_DIR", "bgs")
+
+
+def default_video_ending_path() -> str:
+    """
+    File concatenated in pipeline step 11 (after captions + optional music).
+    Override with VIDEOS_VIDEO_ENDING (repo-relative or absolute path to an .mp4).
+    When unset, uses ``{VIDEOS_ASSETS_DIR}/video_ending/default.mp4``.
+    """
+    override = (os.environ.get("VIDEOS_VIDEO_ENDING") or "").strip()
+    if override:
+        if os.path.isabs(override):
+            return os.path.normpath(override)
+        return os.path.normpath(os.path.join(REPO_ROOT, override))
+    return os.path.normpath(os.path.join(assets_dir(), "video_ending", "default.mp4"))

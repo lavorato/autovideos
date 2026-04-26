@@ -14,9 +14,10 @@ Pipeline:
      tokens into templates/percentage-ring.html.tpl, then call
      `npx hyperframes render` to produce an MP4 clip at the video's own
      dimensions/fps.
-  4. Overlay every clip onto the input video via FFmpeg with
-     enable='between(t,start,end)'. Audio is stream-copied, so the voice
-     keeps playing while the ring covers the frame (fullscreen cutaway).
+  4. Overlay every clip onto the input video via FFmpeg: each clip is opened
+     with ``-itsoffset`` so its frames sit on the same clock as the main
+     track, then ``overlay`` with enable='between(t,start,end)'. Audio is
+     stream-copied so the voice keeps playing during the fullscreen cutaway.
 
 Outputs:
   - .tmp/{base}_dataviz.mp4
@@ -235,6 +236,96 @@ def _clean_token(raw: str) -> str:
     return re.sub(r"[^\wà-ÿ%\.,-]+", "", (raw or "").strip().lower())
 
 
+def _parse_word_time(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _word_span_valid(w: dict) -> bool:
+    """True when start/end look like real alignment (WhisperX uses 0,0 as placeholder)."""
+    s = _parse_word_time(w.get("start"))
+    e = _parse_word_time(w.get("end"))
+    if s is None or e is None:
+        return False
+    if abs(s) < 1e-5 and abs(e) < 1e-5:
+        return False
+    if e < s - 1e-5:
+        return False
+    return True
+
+
+def _word_times_need_fill(w: dict) -> bool:
+    return not _word_span_valid(w)
+
+
+def _prev_valid_end(seg_words: list[dict], idx: int) -> float | None:
+    for j in range(idx - 1, -1, -1):
+        if _word_span_valid(seg_words[j]):
+            return float(seg_words[j]["end"])
+    return None
+
+
+def _next_valid_start(seg_words: list[dict], idx: int) -> float | None:
+    for j in range(idx + 1, len(seg_words)):
+        if _word_span_valid(seg_words[j]):
+            return float(seg_words[j]["start"])
+    return None
+
+
+def _segment_time_bounds(seg: dict, seg_words: list[dict]) -> tuple[float, float]:
+    """Bounds for filling unaligned tokens: prefer real word spans over segment metadata."""
+    raw_s = float(seg.get("start", 0.0) or 0.0)
+    raw_e = float(seg.get("end", raw_s) or raw_s)
+    valid_s = [
+        float(w["start"]) for w in seg_words if _word_span_valid(w)
+    ]
+    valid_e = [float(w["end"]) for w in seg_words if _word_span_valid(w)]
+    if valid_s:
+        # If metadata is still 0,0, min(raw, wmin) would wrongly pin to 0.
+        return min(valid_s), max(valid_e)
+    return raw_s, raw_e
+
+
+def _backfill_flat_from_top_level(flat: list[dict], top_words: list) -> None:
+    """When token lists line up, copy timings from top-level words (usually better aligned)."""
+    if not top_words or len(flat) != len(top_words):
+        return
+    for i, w in enumerate(flat):
+        tw = top_words[i]
+        if not isinstance(tw, dict):
+            continue
+        if _word_span_valid(tw) and _word_times_need_fill(w):
+            w["start"] = tw["start"]
+            w["end"] = tw["end"]
+
+
+def _fill_missing_word_times_in_list(words: list[dict], *, lo: float, hi: float) -> None:
+    """Same interpolation as per-segment, for a flat global word list."""
+    n = len(words)
+    for idx, w in enumerate(words):
+        if not _word_times_need_fill(w):
+            continue
+        prev_end = _prev_valid_end(words, idx)
+        next_start = _next_valid_start(words, idx)
+        if prev_end is not None and next_start is not None:
+            mid = (prev_end + next_start) / 2.0
+            w["start"] = mid
+            w["end"] = next_start
+        elif prev_end is not None:
+            w["start"] = prev_end
+            w["end"] = min(prev_end + 0.25, hi)
+        elif next_start is not None:
+            w["start"] = max(lo, next_start - 0.25)
+            w["end"] = next_start
+        else:
+            w["start"] = lo
+            w["end"] = min(lo + 0.25, hi)
+
+
 def _load_transcript(path: str) -> dict:
     if not os.path.isfile(path):
         return {}
@@ -260,49 +351,46 @@ def _flatten_words(data: dict) -> list[dict]:
     words within the same segment.
     """
     segments = data.get("segments") or []
+    top_level = [w for w in (data.get("words") or []) if isinstance(w, dict)]
+    dur = data.get("video_duration")
+    hi_fallback = float(dur) if isinstance(dur, (int, float)) and float(dur) > 0 else 86400.0
+
     if segments:
         flat: list[dict] = []
         for seg in segments:
-            seg_start = float(seg.get("start", 0.0) or 0.0)
-            seg_end = float(seg.get("end", seg_start) or seg_start)
             seg_words = [w for w in (seg.get("words") or []) if isinstance(w, dict)]
             if not seg_words:
                 continue
-            # Pre-compute prev/next timestamps so we can fill gaps without
-            # dragging unaligned words all the way to t=0.
+            seg_start, seg_end = _segment_time_bounds(seg, seg_words)
+            if seg_end < seg_start:
+                seg_end = seg_start + 0.25
             for idx, w in enumerate(seg_words):
-                if w.get("start") is None or w.get("end") is None:
-                    prev_end = None
-                    for j in range(idx - 1, -1, -1):
-                        if seg_words[j].get("end") is not None:
-                            prev_end = float(seg_words[j]["end"])
-                            break
-                    next_start = None
-                    for j in range(idx + 1, len(seg_words)):
-                        if seg_words[j].get("start") is not None:
-                            next_start = float(seg_words[j]["start"])
-                            break
-                    # Interpolate between neighbors; fall back to segment
-                    # bounds if the word sits at the edge of the segment.
-                    if prev_end is not None and next_start is not None:
-                        mid = (prev_end + next_start) / 2.0
-                        w.setdefault("start", mid)
-                        w.setdefault("end", next_start)
-                    elif prev_end is not None:
-                        w.setdefault("start", prev_end)
-                        w.setdefault("end", min(prev_end + 0.25, seg_end))
-                    elif next_start is not None:
-                        w.setdefault("start", max(seg_start, next_start - 0.25))
-                        w.setdefault("end", next_start)
-                    else:
-                        w.setdefault("start", seg_start)
-                        w.setdefault("end", seg_end)
+                if not _word_times_need_fill(w):
+                    flat.append(w)
+                    continue
+                prev_end = _prev_valid_end(seg_words, idx)
+                next_start = _next_valid_start(seg_words, idx)
+                if prev_end is not None and next_start is not None:
+                    mid = (prev_end + next_start) / 2.0
+                    w["start"] = mid
+                    w["end"] = next_start
+                elif prev_end is not None:
+                    w["start"] = prev_end
+                    w["end"] = min(prev_end + 0.25, seg_end)
+                elif next_start is not None:
+                    w["start"] = max(seg_start, next_start - 0.25)
+                    w["end"] = next_start
+                else:
+                    w["start"] = seg_start
+                    w["end"] = max(seg_end, seg_start + 0.05)
                 flat.append(w)
         if flat:
+            _backfill_flat_from_top_level(flat, top_level)
             return flat
 
-    words = data.get("words") or []
-    return [w for w in words if isinstance(w, dict)]
+    words = list(top_level)
+    _fill_missing_word_times_in_list(words, lo=0.0, hi=hi_fallback)
+    return words
 
 
 def _segments_for_context(data: dict) -> list[dict]:
@@ -740,15 +828,21 @@ def _composite_clips(input_video: str, output_path: str,
     """
     Overlay each rendered clip onto the input video for
     [start, start+duration]. Audio is stream-copied (fullscreen cutaway).
+
+    Timeline alignment uses ``-itsoffset`` on each overlay input so decoded
+    clip PTS matches the main video clock. A pure ``setpts=...+offset/TB`` chain
+    often leaves overlays stuck at t≈0 for MP4 clips from HyperFrames/Chrome
+    where STARTPTS/TB handling does not land where ``overlay`` expects.
     """
     valid = [m for m in moments if m.clip_path]
     if not valid:
         subprocess.run(["cp", input_video, output_path], check=True)
         return output_path
 
-    inputs = ["-i", input_video]
+    inputs: list[str] = ["-i", input_video]
     for m in valid:
-        inputs.extend(["-i", m.clip_path])
+        # Apply offset to the *next* input only (all streams of that file).
+        inputs.extend(["-itsoffset", f"{float(m.start):.6f}", "-i", m.clip_path])
 
     filter_parts: list[str] = []
     current_label = "[0:v]"
@@ -756,17 +850,13 @@ def _composite_clips(input_video: str, output_path: str,
         clip_idx = idx + 1
         scale_label = f"[s{idx}]"
         overlay_label = f"[ov{idx}]"
-        end_t = m.start + m.duration
+        end_t = float(m.start) + float(m.duration)
 
-        # Shift the clip onto the main timeline and force yuv420p so the
-        # overlay filter cannot renegotiate pixel format per input.
-        filter_parts.append(
-            f"[{clip_idx}:v]format=yuv420p,"
-            f"setpts=PTS-STARTPTS+{m.start:.3f}/TB{scale_label}"
-        )
+        # yuv420p only — timestamps come from demuxer (-itsoffset).
+        filter_parts.append(f"[{clip_idx}:v]format=yuv420p{scale_label}")
         filter_parts.append(
             f"{current_label}{scale_label}overlay=0:0:"
-            f"enable='between(t,{m.start:.3f},{end_t:.3f})':"
+            f"enable='between(t,{float(m.start):.6f},{end_t:.6f})':"
             f"eof_action=pass:format=auto{overlay_label}"
         )
         current_label = overlay_label

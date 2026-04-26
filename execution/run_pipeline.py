@@ -65,6 +65,7 @@ ALL_STEPS = [
     {"id": "08e","module": "08e_data_viz",        "func": "apply_data_viz",      "label": "Data Viz Overlay",   "enabled": True},
     {"id": "09", "module": "09_captions",         "func": "add_captions",        "label": "Captions",           "enabled": True},
     {"id": "10", "module": "10_background_music", "func": "add_background_music","label": "Background Music",   "enabled": True},
+    {"id": "11", "module": "11_video_ending",     "func": "append_video_ending", "label": "Video Ending (outro)", "enabled": True},
 ]
 
 REVIEW_GATED_STEP_IDS = editor_gate.editor_gate_step_ids(ALL_STEPS)
@@ -97,6 +98,7 @@ def step_output_patterns() -> dict:
         "08e": [os.path.join(t, "{base}_dataviz.mp4")],
         "09": [os.path.join(o, "{base}_final.mp4")],
         "10": [os.path.join(o, "{base}_final.mp4")],
+        "11": [os.path.join(o, "{base}_final.mp4")],
     }
 
 

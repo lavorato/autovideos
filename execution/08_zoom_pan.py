@@ -11,9 +11,14 @@ from moviepy import VideoFileClip
 import subprocess
 import env_paths
 from video_encoding import build_moviepy_lossless_params
+from editor_gate import stem_for_editor_gate
+from face_positions_io import face_positions_json_path, write_face_positions_json
+
+FACE_SAMPLE_FPS = 5.0
+FACE_DETECT_MAX_DIM = 640
 
 
-def detect_face_positions(video_path: str, sample_fps: float = 5.0) -> list:
+def detect_face_positions(video_path: str, sample_fps: float = FACE_SAMPLE_FPS) -> list:
     """Sample frames and detect face center positions using Haar cascade."""
     print("[08] Detecting face positions (Haar cascade)...")
     face_cascade = cv2.CascadeClassifier(
@@ -37,18 +42,28 @@ def detect_face_positions(video_path: str, sample_fps: float = 5.0) -> list:
         if frame_idx % sample_interval == 0:
             t = frame_idx / fps
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            scale = min(1.0, 640.0 / max(width, height))
+            scale = min(1.0, float(FACE_DETECT_MAX_DIM) / max(width, height))
             small = cv2.resize(gray, None, fx=scale, fy=scale)
             faces = face_cascade.detectMultiScale(small, 1.1, 5, minSize=(30, 30))
 
             cx, cy = 0.5, 0.5
+            y0, y1 = None, None
             if len(faces) > 0:
                 largest = max(faces, key=lambda f: f[2] * f[3])
                 fx, fy, fw, fh = largest
-                cx = (fx + fw / 2) / small.shape[1]
-                cy = (fy + fh / 2) / small.shape[0]
+                sh, sw = small.shape[0], small.shape[1]
+                cx = (fx + fw / 2) / sw
+                cy = (fy + fh / 2) / sh
+                y0 = float(fy / sh)
+                y1 = float((fy + fh) / sh)
 
-            positions.append({"time": t, "cx": cx, "cy": cy})
+            positions.append({
+                "time": t,
+                "cx": cx,
+                "cy": cy,
+                "y0": y0,
+                "y1": y1,
+            })
 
         frame_idx += 1
 
@@ -65,9 +80,17 @@ def smooth_positions(positions: list, window: int = 5) -> list:
     for i in range(len(positions)):
         start = max(0, i - window // 2)
         end = min(len(positions), i + window // 2 + 1)
-        avg_cx = np.mean([p["cx"] for p in positions[start:end]])
-        avg_cy = np.mean([p["cy"] for p in positions[start:end]])
-        smoothed.append({"time": positions[i]["time"], "cx": avg_cx, "cy": avg_cy})
+        chunk = positions[start:end]
+        avg_cx = np.mean([p["cx"] for p in chunk])
+        avg_cy = np.mean([p["cy"] for p in chunk])
+        y0s = [p["y0"] for p in chunk if p.get("y0") is not None]
+        y1s = [p["y1"] for p in chunk if p.get("y1") is not None]
+        row = {"time": positions[i]["time"], "cx": avg_cx, "cy": avg_cy}
+        if y0s:
+            row["y0"] = float(np.mean(y0s))
+        if y1s:
+            row["y1"] = float(np.mean(y1s))
+        smoothed.append(row)
     return smoothed
 
 
@@ -123,8 +146,8 @@ def apply_zoom_pan(video_path: str, tmp_dir: str | None = None) -> str:
         input_video = video_path
     output_path = os.path.join(tmp_dir, f"{base}_effects.mp4")
 
-    positions, width, height, fps = detect_face_positions(input_video)
-    positions = smooth_positions(positions)
+    raw_samples, width, height, fps = detect_face_positions(input_video)
+    positions = smooth_positions(raw_samples)
 
     # Get duration
     probe = subprocess.run(
@@ -133,6 +156,35 @@ def apply_zoom_pan(video_path: str, tmp_dir: str | None = None) -> str:
         capture_output=True, text=True, check=True,
     )
     duration = float(probe.stdout.strip())
+
+    face_stem = stem_for_editor_gate(base)
+    face_json_path = face_positions_json_path(tmp_dir, face_stem)
+    try:
+        write_face_positions_json(
+            face_json_path,
+            {
+                "generator": "08_zoom_pan",
+                "input_basename": os.path.basename(input_video),
+                "face_sample_fps": FACE_SAMPLE_FPS,
+                "face_detect_max_dim": FACE_DETECT_MAX_DIM,
+                "opencv": {
+                    "width": width,
+                    "height": height,
+                    "fps": round(float(fps or 0.0), 4),
+                    "first_frame_wh": None,
+                },
+                "ffprobe": {
+                    "width": width,
+                    "height": height,
+                    "duration": round(float(duration), 4),
+                },
+                "samples": raw_samples,
+                "smoothed": positions,
+            },
+        )
+        print(f"[08] Face positions JSON: {face_json_path}", flush=True)
+    except OSError as exc:
+        print(f"[08] Could not write face positions sidecar: {exc}", flush=True)
 
     effects = generate_zoom_pan_filter(positions, width, height, fps, duration)
 
